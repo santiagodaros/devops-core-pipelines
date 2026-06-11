@@ -1,0 +1,36 @@
+# =============================================================================
+# Auto-aprobación de PRs del owner
+# Propósito: Permite que @santiagodaros pueda mergear sus propios PRs.
+#            GitHub no permite aprobar tu propio PR, así que este workflow
+#            usa github-actions[bot] (cuenta distinta) para dar la aprobación
+#            requerida cuando el autor del PR es el owner del repositorio.
+# =============================================================================
+name: "Auto-approve PRs del owner"
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  auto-approve:
+    name: "Aprobar PR del owner"
+    runs-on: ubuntu-latest
+    # Solo aprobar PRs abiertos por el owner — nunca aprobar PRs externos automáticamente
+    if: github.actor == 'santiagodaros'
+    steps:
+      - name: "Aprobar PR via github-actions[bot]"
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.pulls.createReview({
+              owner:       context.repo.owner,
+              repo:        context.repo.repo,
+              pull_number: context.issue.number,
+              event:       'APPROVE',
+              body:        '✅ Auto-aprobado: PR del owner verificado por github-actions[bot].',
+            });
+            console.log(`PR #${context.issue.number} aprobado.`);
