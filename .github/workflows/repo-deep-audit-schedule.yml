@@ -1,0 +1,92 @@
+# =============================================================================
+# Pipeline Programado: Auditoría Profunda del Repositorio
+# Disparador: Cron (viernes 18:00 UTC) + workflow_dispatch (manual)
+# Propósito: Escaneo completo con Super-Linter (calidad de código en múltiples
+#            lenguajes) y Trivy (vulnerabilidades en dependencias e imágenes).
+# =============================================================================
+name: "Scheduled - Auditoría Profunda del Repositorio"
+
+on:
+  schedule:
+    - cron: "0 18 * * 5"   # Cada viernes a las 18:00 UTC
+  workflow_dispatch:         # Permite ejecución manual desde la interfaz de GitHub
+    inputs:
+      scan-target:
+        description: "Objetivo del escaneo Trivy: 'fs' (filesystem) o 'image'"
+        required: false
+        default: "fs"
+        type: choice
+        options:
+          - fs
+          - image
+      image-ref:
+        description: "Referencia de imagen Docker (solo si scan-target=image)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  security-events: write  # Para publicar resultados SARIF en GitHub Security
+
+jobs:
+  super-linter:
+    name: "Super-Linter: Calidad de Código"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout del código fuente"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: "Ejecutar Super-Linter"
+        uses: super-linter/super-linter@v7
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEFAULT_BRANCH: main
+          VALIDATE_ALL_CODEBASE: true
+          # Habilitar linters específicos según los lenguajes del repo
+          VALIDATE_YAML: true
+          VALIDATE_BASH: true
+          VALIDATE_POWERSHELL: true
+          VALIDATE_TERRAFORM_TFLINT: true
+          VALIDATE_JSON: true
+          VALIDATE_MARKDOWN: true
+          # Reportar pero no fallar en warnings (solo errores rompen el pipeline)
+          DISABLE_ERRORS: false
+
+  trivy-scan:
+    name: "Trivy: Escaneo de Vulnerabilidades"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout del código fuente"
+        uses: actions/checkout@v4
+
+      - name: "Escanear filesystem con Trivy"
+        if: ${{ github.event.inputs.scan-target != 'image' }}
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          severity: "CRITICAL,HIGH"
+          format: "sarif"
+          output: "trivy-results.sarif"
+          exit-code: "0"    # No falla el pipeline, solo reporta
+
+      - name: "Escanear imagen Docker con Trivy"
+        if: ${{ github.event.inputs.scan-target == 'image' && github.event.inputs.image-ref != '' }}
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "image"
+          image-ref: ${{ github.event.inputs.image-ref }}
+          severity: "CRITICAL,HIGH"
+          format: "sarif"
+          output: "trivy-results.sarif"
+          exit-code: "0"
+
+      - name: "Publicar resultados en GitHub Security (SARIF)"
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "trivy-results.sarif"
+          category: "trivy"

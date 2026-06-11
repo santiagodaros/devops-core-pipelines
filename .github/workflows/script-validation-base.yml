@@ -1,0 +1,73 @@
+# =============================================================================
+# Pipeline Base: Validación de Scripts (Reusable Workflow)
+# Disparador: workflow_call (invocado desde repositorios esclavos)
+# Propósito: Analiza calidad de scripts PowerShell con PSScriptAnalyzer
+#            y escanea secretos con Gitleaks.
+# =============================================================================
+name: "Base - Validación de Scripts"
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Directorio raíz donde se encuentran los scripts a analizar"
+        required: false
+        type: string
+        default: "."
+      fail-on-secrets:
+        description: "Falla el pipeline si se detectan secretos expuestos"
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      GITLEAKS_LICENSE:
+        description: "Licencia opcional de Gitleaks para funciones avanzadas"
+        required: false
+
+jobs:
+  psscriptanalyzer:
+    name: "Análisis PSScriptAnalyzer"
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: "Checkout del código fuente"
+        uses: actions/checkout@v4
+
+      - name: "Instalar PSScriptAnalyzer"
+        shell: pwsh
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+
+      - name: "Ejecutar análisis de scripts PowerShell"
+        shell: pwsh
+        run: |
+          $scripts = Get-ChildItem -Recurse -Filter "*.ps1" -ErrorAction SilentlyContinue
+          if ($scripts.Count -eq 0) {
+            Write-Host "No se encontraron archivos .ps1 para analizar."
+            exit 0
+          }
+          $results = $scripts | Invoke-ScriptAnalyzer -Severity Error, Warning
+          if ($results) {
+            $results | Format-Table -AutoSize
+            exit 1
+          }
+          Write-Host "✅ Análisis completado sin errores ni advertencias."
+
+  secret-scan:
+    name: "Escaneo de Secretos con Gitleaks"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout del código fuente"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: "Escanear secretos con Gitleaks"
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+        continue-on-error: ${{ !inputs.fail-on-secrets }}

@@ -1,0 +1,110 @@
+# =============================================================================
+# Pipeline Base: Simulación de IaC (Reusable Workflow)
+# Disparador: workflow_call (invocado desde repositorios esclavos)
+# Propósito: Valida sintaxis de Bicep/Terraform y ejecuta What-If / Plan
+#            sin aplicar cambios reales en la nube.
+# =============================================================================
+name: "Base - Simulación de IaC"
+
+on:
+  workflow_call:
+    inputs:
+      iac-type:
+        description: "Tipo de IaC a validar: 'bicep' o 'terraform'"
+        required: true
+        type: string
+      working-directory:
+        description: "Directorio donde se encuentra el código IaC"
+        required: false
+        type: string
+        default: "."
+      azure-resource-group:
+        description: "Grupo de recursos Azure para What-If (solo Bicep)"
+        required: false
+        type: string
+        default: ""
+      azure-location:
+        description: "Región Azure para la simulación (solo Bicep)"
+        required: false
+        type: string
+        default: "eastus"
+    secrets:
+      AZURE_CLIENT_ID:
+        description: "Client ID de la identidad federada Azure (OIDC)"
+        required: false
+      AZURE_TENANT_ID:
+        description: "Tenant ID de Azure"
+        required: false
+      AZURE_SUBSCRIPTION_ID:
+        description: "Subscription ID de Azure"
+        required: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  validate-bicep:
+    name: "Validación y What-If Bicep"
+    if: ${{ inputs.iac-type == 'bicep' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: "Checkout del código fuente"
+        uses: actions/checkout@v4
+
+      - name: "Login a Azure con OIDC (identidad federada)"
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: "Instalar Bicep CLI"
+        run: az bicep install
+
+      - name: "Validar sintaxis de todos los archivos Bicep"
+        run: |
+          find . -name "*.bicep" | while read file; do
+            echo "Validando: $file"
+            az bicep build --file "$file" --stdout > /dev/null
+          done
+          echo "✅ Todos los archivos Bicep son sintácticamente válidos."
+
+      - name: "Ejecutar simulación What-If"
+        if: ${{ inputs.azure-resource-group != '' }}
+        run: |
+          TEMPLATE=$(find . -name "main.bicep" | head -1)
+          if [ -z "$TEMPLATE" ]; then
+            echo "No se encontró main.bicep, omitiendo What-If."
+            exit 0
+          fi
+          az deployment group what-if \
+            --resource-group "${{ inputs.azure-resource-group }}" \
+            --template-file "$TEMPLATE" \
+            --no-pretty-print
+
+  validate-terraform:
+    name: "Validación y Plan Terraform"
+    if: ${{ inputs.iac-type == 'terraform' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: "Checkout del código fuente"
+        uses: actions/checkout@v4
+
+      - name: "Configurar Terraform"
+        uses: hashicorp/setup-terraform@v3
+
+      - name: "Inicializar Terraform (solo backend local para validación)"
+        run: terraform init -backend=false
+
+      - name: "Validar sintaxis de Terraform"
+        run: terraform validate
+
+      - name: "Verificar formato de archivos Terraform"
+        run: terraform fmt -check -recursive

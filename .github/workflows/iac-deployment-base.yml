@@ -1,0 +1,126 @@
+# =============================================================================
+# Pipeline Base: Despliegue de IaC (Reusable Workflow)
+# Disparador: workflow_call (invocado desde repositorios esclavos)
+# Propósito: Despliega infraestructura en Azure/AWS de forma segura usando
+#            identidades federadas (OIDC) — sin secretos de larga duración.
+# =============================================================================
+name: "Base - Despliegue de IaC"
+
+on:
+  workflow_call:
+    inputs:
+      cloud-provider:
+        description: "Proveedor cloud: 'azure' o 'aws'"
+        required: true
+        type: string
+      iac-type:
+        description: "Tipo de IaC: 'bicep' o 'terraform'"
+        required: true
+        type: string
+      environment:
+        description: "Ambiente de destino: dev, staging, prod"
+        required: true
+        type: string
+      working-directory:
+        description: "Directorio donde se encuentra el código IaC"
+        required: false
+        type: string
+        default: "."
+      azure-resource-group:
+        description: "Grupo de recursos destino (solo Azure/Bicep)"
+        required: false
+        type: string
+        default: ""
+      azure-deployment-name:
+        description: "Nombre del deployment en Azure"
+        required: false
+        type: string
+        default: "pipeline-deployment"
+    secrets:
+      AZURE_CLIENT_ID:
+        description: "Client ID de la identidad federada Azure (OIDC)"
+        required: false
+      AZURE_TENANT_ID:
+        description: "Tenant ID de Azure"
+        required: false
+      AZURE_SUBSCRIPTION_ID:
+        description: "Subscription ID de Azure"
+        required: false
+      AWS_ROLE_ARN:
+        description: "ARN del rol IAM de AWS para asumir via OIDC"
+        required: false
+      TF_BACKEND_CONFIG:
+        description: "Configuración del backend remoto de Terraform (JSON)"
+        required: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: "Despliegue en ${{ inputs.cloud-provider }} / ${{ inputs.environment }}"
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+
+    steps:
+      - name: "Checkout del código fuente"
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Autenticación Azure con OIDC (sin secretos estáticos)
+      # -----------------------------------------------------------------------
+      - name: "Login a Azure con identidad federada (OIDC)"
+        if: ${{ inputs.cloud-provider == 'azure' }}
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # -----------------------------------------------------------------------
+      # Autenticación AWS con OIDC
+      # -----------------------------------------------------------------------
+      - name: "Configurar credenciales AWS con OIDC"
+        if: ${{ inputs.cloud-provider == 'aws' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      # -----------------------------------------------------------------------
+      # Despliegue Bicep en Azure
+      # -----------------------------------------------------------------------
+      - name: "Instalar Bicep CLI"
+        if: ${{ inputs.iac-type == 'bicep' }}
+        run: az bicep install
+
+      - name: "Desplegar con Bicep"
+        if: ${{ inputs.iac-type == 'bicep' && inputs.cloud-provider == 'azure' }}
+        run: |
+          TEMPLATE=$(find . -name "main.bicep" | head -1)
+          az deployment group create \
+            --name "${{ inputs.azure-deployment-name }}-$(date +%Y%m%d%H%M%S)" \
+            --resource-group "${{ inputs.azure-resource-group }}" \
+            --template-file "$TEMPLATE" \
+            --parameters environment="${{ inputs.environment }}"
+
+      # -----------------------------------------------------------------------
+      # Despliegue Terraform
+      # -----------------------------------------------------------------------
+      - name: "Configurar Terraform"
+        if: ${{ inputs.iac-type == 'terraform' }}
+        uses: hashicorp/setup-terraform@v3
+
+      - name: "Terraform Init"
+        if: ${{ inputs.iac-type == 'terraform' }}
+        run: terraform init
+
+      - name: "Terraform Apply"
+        if: ${{ inputs.iac-type == 'terraform' }}
+        run: |
+          terraform apply -auto-approve \
+            -var="environment=${{ inputs.environment }}"

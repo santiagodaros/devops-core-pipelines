@@ -1,0 +1,93 @@
+# =============================================================================
+# Pipeline Programado: Cloud Janitor - Apagado de VMs de Desarrollo
+# Disparador: Cron (lunes a viernes 20:00 UTC) + workflow_dispatch (manual)
+# Propósito: Apaga automáticamente todas las VMs etiquetadas como 'environment=dev'
+#            en Azure para reducir costos fuera del horario laboral.
+# =============================================================================
+name: "Scheduled - Cloud Janitor: Apagado de VMs Dev"
+
+on:
+  schedule:
+    - cron: "0 20 * * 1-5"  # Lunes a viernes a las 20:00 UTC
+  workflow_dispatch:          # Permite ejecución manual desde la interfaz de GitHub
+    inputs:
+      dry-run:
+        description: "Modo simulación: listar VMs sin apagarlas"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      target-tag-value:
+        description: "Valor de la etiqueta 'environment' a apagar (default: dev)"
+        required: false
+        type: string
+        default: "dev"
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TARGET_ENV_TAG: ${{ github.event.inputs.target-tag-value || 'dev' }}
+  DRY_RUN: ${{ github.event.inputs.dry-run || 'false' }}
+
+jobs:
+  shutdown-azure-dev-vms:
+    name: "Apagar VMs Dev en Azure"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout del código fuente"
+        uses: actions/checkout@v4
+
+      - name: "Login a Azure con identidad federada (OIDC)"
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: "Listar VMs con etiqueta environment=${{ env.TARGET_ENV_TAG }}"
+        id: list-vms
+        run: |
+          echo "Buscando VMs con tag environment=${{ env.TARGET_ENV_TAG }}..."
+          VM_IDS=$(az vm list \
+            --query "[?tags.environment=='${{ env.TARGET_ENV_TAG }}'].id" \
+            --output tsv)
+
+          if [ -z "$VM_IDS" ]; then
+            echo "No se encontraron VMs con el tag environment=${{ env.TARGET_ENV_TAG }}."
+            echo "vm_count=0" >> "$GITHUB_OUTPUT"
+          else
+            VM_COUNT=$(echo "$VM_IDS" | wc -l)
+            echo "vm_count=$VM_COUNT" >> "$GITHUB_OUTPUT"
+            echo "VMs encontradas ($VM_COUNT):"
+            echo "$VM_IDS"
+          fi
+
+      - name: "Apagar VMs (modo real)"
+        if: ${{ env.DRY_RUN == 'false' && steps.list-vms.outputs.vm_count != '0' }}
+        run: |
+          echo "Apagando VMs con tag environment=${{ env.TARGET_ENV_TAG }}..."
+          az vm list \
+            --query "[?tags.environment=='${{ env.TARGET_ENV_TAG }}'].id" \
+            --output tsv | \
+          xargs -I {} az vm deallocate --ids {} --no-wait
+          echo "✅ Señal de apagado enviada a todas las VMs de desarrollo."
+
+      - name: "Modo simulación activo (Dry-Run)"
+        if: ${{ env.DRY_RUN == 'true' }}
+        run: |
+          echo "⚠️  DRY-RUN activado: las VMs listadas arriba NO fueron apagadas."
+
+      - name: "Generar resumen en el job summary"
+        if: always()
+        run: |
+          echo "## 🧹 Cloud Janitor - Resumen" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Campo | Valor |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Tag objetivo | \`environment=${{ env.TARGET_ENV_TAG }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| VMs encontradas | ${{ steps.list-vms.outputs.vm_count }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Modo | ${{ env.DRY_RUN == 'true' && 'Simulación (Dry-Run)' || 'Apagado real' }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Ejecutado el | $(date -u '+%Y-%m-%d %H:%M UTC') |" >> "$GITHUB_STEP_SUMMARY"
