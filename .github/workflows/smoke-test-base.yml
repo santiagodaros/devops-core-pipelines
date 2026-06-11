@@ -1,0 +1,177 @@
+# =============================================================================
+# Pipeline Base: Smoke Test post-Despliegue (Reusable Workflow)
+# Disparador: workflow_call (invocado desde repositorios esclavos)
+# Propósito: Verificar que el sistema responde correctamente después de un
+#            despliegue. Valida endpoints HTTP, tiempos de respuesta y
+#            ejecuta un test de carga básico con k6 si se configura.
+# =============================================================================
+name: "Base - Smoke Test post-Despliegue"
+
+on:
+  workflow_call:
+    inputs:
+      base-url:
+        description: "URL base del sistema desplegado (ej: https://api.miapp.com)"
+        required: true
+        type: string
+      endpoints:
+        description: |
+          JSON array de endpoints a verificar. Ejemplo:
+          '[{"path":"/health","method":"GET","expected_status":200},{"path":"/api/version","method":"GET","expected_status":200}]'
+        required: false
+        type: string
+        default: '[{"path":"/health","method":"GET","expected_status":200}]'
+      wait-seconds:
+        description: "Segundos de espera antes de iniciar las verificaciones (para que el deploy estabilice)"
+        required: false
+        type: number
+        default: 30
+      timeout-seconds:
+        description: "Timeout máximo por request HTTP en segundos"
+        required: false
+        type: number
+        default: 30
+      max-response-time-ms:
+        description: "Tiempo de respuesta máximo aceptable en milisegundos"
+        required: false
+        type: number
+        default: 3000
+      run-load-test:
+        description: "Si true, ejecuta un test de carga básico con k6 después del smoke test"
+        required: false
+        type: boolean
+        default: false
+      k6-vus:
+        description: "Usuarios virtuales simultáneos para el test de carga k6"
+        required: false
+        type: number
+        default: 10
+      k6-duration:
+        description: "Duración del test de carga k6 (ej: 30s, 1m)"
+        required: false
+        type: string
+        default: "30s"
+    outputs:
+      smoke-test-passed:
+        description: "'true' si todos los endpoints respondieron correctamente"
+        value: ${{ jobs.smoke-test.outputs.passed }}
+
+jobs:
+  smoke-test:
+    name: "Smoke Test → ${{ inputs.base-url }}"
+    runs-on: ubuntu-latest
+    outputs:
+      passed: ${{ steps.verify.outputs.passed }}
+    steps:
+      - name: "Esperar ${{ inputs.wait-seconds }}s para que el deploy estabilice"
+        run: |
+          echo "Esperando ${{ inputs.wait-seconds }} segundos..."
+          sleep ${{ inputs.wait-seconds }}
+
+      - name: "Verificar endpoints"
+        id: verify
+        run: |
+          BASE_URL="${{ inputs.base-url }}"
+          ENDPOINTS='${{ inputs.endpoints }}'
+          MAX_TIME=${{ inputs.max-response-time-ms }}
+          TIMEOUT=${{ inputs.timeout-seconds }}
+          ALL_PASSED=true
+
+          echo "## Resultados del Smoke Test" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Endpoint | Método | Status esperado | Status real | Tiempo (ms) | Resultado |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "$ENDPOINTS" | jq -c '.[]' | while read -r endpoint; do
+            PATH_VAL=$(echo "$endpoint" | jq -r '.path')
+            METHOD=$(echo "$endpoint" | jq -r '.method // "GET"')
+            EXPECTED=$(echo "$endpoint" | jq -r '.expected_status // 200')
+            URL="$BASE_URL$PATH_VAL"
+
+            START_MS=$(date +%s%3N)
+            RESPONSE=$(curl -s -o /tmp/response_body -w "%{http_code}" \
+              -X "$METHOD" \
+              --max-time "$TIMEOUT" \
+              "$URL" 2>/dev/null || echo "000")
+            END_MS=$(date +%s%3N)
+            ELAPSED=$((END_MS - START_MS))
+
+            if [ "$RESPONSE" = "$EXPECTED" ] && [ "$ELAPSED" -le "$MAX_TIME" ]; then
+              ICON="✅"
+              RESULT="PASS"
+            else
+              ICON="❌"
+              RESULT="FAIL"
+              ALL_PASSED=false
+            fi
+
+            echo "| \`$PATH_VAL\` | $METHOD | $EXPECTED | $RESPONSE | ${ELAPSED}ms | $ICON $RESULT |" >> "$GITHUB_STEP_SUMMARY"
+            echo "$ICON [$METHOD] $URL → HTTP $RESPONSE (${ELAPSED}ms) — $RESULT"
+          done
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Base URL:** \`$BASE_URL\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Tiempo máximo aceptable:** ${MAX_TIME}ms" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$ALL_PASSED" = "false" ]; then
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            echo "❌ Smoke test fallido. Algunos endpoints no respondieron como se esperaba."
+            exit 1
+          else
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Todos los endpoints respondieron correctamente."
+          fi
+
+  load-test:
+    name: "Test de carga k6 (${{ inputs.k6-vus }} VUs · ${{ inputs.k6-duration }})"
+    if: inputs.run-load-test == true
+    needs: smoke-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Instalar k6"
+        run: |
+          curl -s https://github.com/grafana/k6/releases/download/v0.54.0/k6-v0.54.0-linux-amd64.tar.gz \
+            | tar xz --strip-components=1 k6-v0.54.0-linux-amd64/k6
+          chmod +x k6
+
+      - name: "Generar script k6"
+        run: |
+          cat > load-test.js << 'EOF'
+          import http from 'k6/http';
+          import { check, sleep } from 'k6';
+          import { Rate, Trend } from 'k6/metrics';
+
+          const errorRate   = new Rate('error_rate');
+          const responseTime = new Trend('response_time_ms', true);
+
+          export const options = {
+            vus:      __ENV.K6_VUS      ? parseInt(__ENV.K6_VUS)  : 10,
+            duration: __ENV.K6_DURATION ? __ENV.K6_DURATION       : '30s',
+            thresholds: {
+              http_req_failed:   ['rate<0.05'],      // < 5% de errores
+              http_req_duration: ['p(95)<3000'],     // p95 < 3000ms
+              error_rate:        ['rate<0.05'],
+            },
+          };
+
+          export default function () {
+            const res = http.get(__ENV.BASE_URL + '/health');
+            const ok  = check(res, { 'status 2xx': (r) => r.status >= 200 && r.status < 400 });
+            errorRate.add(!ok);
+            responseTime.add(res.timings.duration);
+            sleep(1);
+          }
+          EOF
+
+      - name: "Ejecutar test de carga"
+        env:
+          BASE_URL:     ${{ inputs.base-url }}
+          K6_VUS:       ${{ inputs.k6-vus }}
+          K6_DURATION:  ${{ inputs.k6-duration }}
+        run: |
+          ./k6 run \
+            --env BASE_URL="$BASE_URL" \
+            --env K6_VUS="$K6_VUS" \
+            --env K6_DURATION="$K6_DURATION" \
+            --summary-trend-stats="min,avg,med,max,p(90),p(95),p(99)" \
+            load-test.js

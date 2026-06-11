@@ -1,0 +1,177 @@
+# =============================================================================
+# Pipeline Programado: Detección de Drift de Infraestructura
+# Disparador: Cron (lunes a viernes 07:00 UTC) + workflow_dispatch (manual)
+# Propósito: Detecta cuando alguien modificó infraestructura manualmente en
+#            Azure/AWS sin pasar por Terraform (drift). Si hay diferencias,
+#            abre un GitHub Issue automáticamente para alertar al equipo.
+# =============================================================================
+name: "Scheduled - Detección de Drift IaC"
+
+on:
+  schedule:
+    - cron: "0 7 * * 1-5"   # Lunes a viernes a las 07:00 UTC (antes del horario laboral)
+  workflow_dispatch:
+    inputs:
+      working-directory:
+        description: "Directorio del código Terraform a analizar"
+        required: false
+        default: "."
+        type: string
+      environment:
+        description: "Ambiente a verificar"
+        required: false
+        default: "prod"
+        type: choice
+        options: [dev, staging, prod]
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write              # Para abrir el Issue de alerta automáticamente
+
+env:
+  TF_DIR: ${{ github.event.inputs.working-directory || '.' }}
+  TARGET_ENV: ${{ github.event.inputs.environment || 'prod' }}
+
+jobs:
+  detect-drift:
+    name: "Detectar drift en ${{ env.TARGET_ENV }}"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout del código fuente"
+        uses: actions/checkout@v4
+
+      - name: "Login a Azure con OIDC"
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: "Configurar Terraform"
+        uses: hashicorp/setup-terraform@v3
+
+      - name: "Cachear providers de Terraform"
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TF_DIR }}/.terraform
+          key: terraform-providers-${{ runner.os }}-${{ hashFiles(format('{0}/.terraform.lock.hcl', env.TF_DIR)) }}
+          restore-keys: terraform-providers-${{ runner.os }}-
+
+      - name: "Terraform Init"
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init
+
+      - name: "Terraform Plan — detectar diferencias con la nube"
+        id: plan
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          # Exit code 0 = sin cambios, 1 = error, 2 = hay cambios (drift detectado)
+          set +e
+          terraform plan \
+            -var="environment=${{ env.TARGET_ENV }}" \
+            -detailed-exitcode \
+            -out=tfplan.binary \
+            -no-color 2>&1 | tee plan-output.txt
+          EXIT_CODE=$?
+          set -e
+
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+          if [ "$EXIT_CODE" -eq 0 ]; then
+            echo "drift=false" >> "$GITHUB_OUTPUT"
+            echo "✅ Sin drift detectado. La infraestructura coincide con el código."
+          elif [ "$EXIT_CODE" -eq 2 ]; then
+            echo "drift=true" >> "$GITHUB_OUTPUT"
+            echo "⚠️  DRIFT DETECTADO: la infraestructura real difiere del estado en Terraform."
+            # Extraer solo el resumen del plan
+            SUMMARY=$(grep -E "^Plan:|^No changes" plan-output.txt | head -1)
+            echo "summary=$SUMMARY" >> "$GITHUB_OUTPUT"
+          else
+            echo "❌ Error al ejecutar terraform plan. Verificar configuración."
+            exit 1
+          fi
+
+      - name: "Generar Job Summary"
+        if: always()
+        run: |
+          echo "## 🔍 Drift Detection — ${{ env.TARGET_ENV }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.plan.outputs.drift }}" = "true" ]; then
+            echo "### ⚠️ DRIFT DETECTADO" >> "$GITHUB_STEP_SUMMARY"
+            echo "La infraestructura real en **${{ env.TARGET_ENV }}** difiere del código Terraform." >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+            cat plan-output.txt >> "$GITHUB_STEP_SUMMARY"
+            echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### ✅ Sin drift" >> "$GITHUB_STEP_SUMMARY"
+            echo "La infraestructura coincide perfectamente con el código Terraform." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Campo | Valor |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Ambiente | \`${{ env.TARGET_ENV }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Ejecutado | $(date -u '+%Y-%m-%d %H:%M UTC') |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "Abrir GitHub Issue si hay drift"
+        if: steps.plan.outputs.drift == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const planOutput = fs.readFileSync('plan-output.txt', 'utf8');
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            // Buscar si ya existe un issue de drift abierto para este ambiente
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'drift-detected,${{ env.TARGET_ENV }}'
+            });
+
+            const title = `⚠️ Drift detectado en infraestructura: ${{ env.TARGET_ENV }} (${new Date().toISOString().slice(0,10)})`;
+            const body = `## Drift de Infraestructura Detectado
+
+            **Ambiente:** \`${{ env.TARGET_ENV }}\`
+            **Detectado:** ${new Date().toUTCString()}
+            **Run:** [Ver detalles completos](${runUrl})
+
+            La infraestructura real en Azure **difiere del estado definido en Terraform**. Esto puede indicar:
+            - Un cambio manual realizado directamente en el portal de Azure
+            - Una modificación aplicada fuera del pipeline de IaC
+            - Un recurso modificado por un proceso externo
+
+            ### Diff del plan
+            \`\`\`hcl
+            ${planOutput.slice(0, 3000)}${planOutput.length > 3000 ? '\n... (ver run completo para más detalles)' : ''}
+            \`\`\`
+
+            ### Acciones recomendadas
+            1. Identificar quién y cuándo realizó el cambio manual (Azure Activity Log)
+            2. Decidir si el cambio es legítimo → actualizar el código Terraform
+            3. O revertir el cambio manual → ejecutar \`iac-deployment-base.yml\` para restaurar
+
+            ---
+            _Generado automáticamente por drift-detection-schedule · [devops-core-pipelines](https://github.com/santiagodaros/devops-core-pipelines)_`;
+
+            if (issues.length > 0) {
+              // Actualizar issue existente con nuevo comentario
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issues[0].number,
+                body: `### Nueva detección — ${new Date().toUTCString()}\n\n[Ver run](${runUrl})\n\n\`\`\`\n${planOutput.slice(0,1000)}\n\`\`\``
+              });
+            } else {
+              // Crear nuevo issue
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: ['drift-detected', '${{ env.TARGET_ENV }}', 'infrastructure']
+              });
+            }

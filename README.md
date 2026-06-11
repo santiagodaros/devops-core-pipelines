@@ -14,8 +14,8 @@ Cualquier repositorio de proyecto puede invocar estos pipelines con una sola lí
   - [Programados (schedule)](#programados-schedule)
 - [Patrones de encadenamiento](#patrones-de-encadenamiento)
 - [Configuración de secretos](#configuración-de-secretos)
-- [Cómo invocar un pipeline desde tu proyecto](#cómo-invocar-un-pipeline-desde-tu-proyecto)
 - [Mantenimiento automático (Dependabot)](#mantenimiento-automático-dependabot)
+- [Gobernanza del repositorio](#gobernanza-del-repositorio)
 
 ---
 
@@ -31,12 +31,15 @@ Cualquier repositorio de proyecto puede invocar estos pipelines con una sola lí
 │  │                     │   │                         │  │
 │  │  pr-validation      │   │  repo-deep-audit        │  │
 │  │  script-validation  │   │  cloud-janitor          │  │
-│  │  iac-simulation     │   └─────────────────────────┘  │
-│  │  iac-deployment     │                                 │
-│  │  tf-dev-helper      │                                 │
+│  │  iac-simulation     │   │  drift-detection        │  │
+│  │  iac-deployment     │   │  stale-resources        │  │
+│  │  tf-dev-helper      │   └─────────────────────────┘  │
 │  │  cost-estimation    │                                 │
 │  │  container-build    │                                 │
 │  │  release            │                                 │
+│  │  rollback           │                                 │
+│  │  env-promotion      │                                 │
+│  │  smoke-test         │                                 │
 │  └──────────┬──────────┘                                 │
 └─────────────┼───────────────────────────────────────────┘
               │ uses: santiagodaros/devops-core-pipelines/...@main
@@ -248,6 +251,74 @@ permissions:
 
 ---
 
+---
+
+#### `rollback-base.yml`
+**Propósito:** Revertir un despliegue roto a la última versión estable en segundos. Reduce el MTTR de minutos a un click.
+
+**Qué hace, paso a paso:**
+1. Si no se especifica un tag, resuelve automáticamente el **penúltimo tag semántico** del repositorio (la versión anterior a la actual)
+2. Hace checkout del código en ese tag específico
+3. Requiere aprobación del **GitHub Environment** configurado (gate de seguridad antes de tocar producción)
+4. Redesplega con Terraform o Bicep usando las credenciales OIDC
+5. Genera un Job Summary con quién hizo el rollback, a qué versión y el timestamp
+
+**Disparadores:** `workflow_call` desde otro pipeline (ej: al fallar un smoke test) **o** `workflow_dispatch` manual desde la UI de GitHub en emergencias.
+
+**Inputs principales:**
+| Input | Tipo | Requerido | Descripción |
+|---|---|---|---|
+| `environment` | string | ✅ | `dev`, `staging` o `prod` |
+| `target-tag` | string | | Tag específico. Vacío = penúltimo tag automático |
+| `iac-type` | string | | `terraform` (default) o `bicep` |
+
+---
+
+#### `env-promotion-base.yml`
+**Propósito:** Formalizar el flujo `dev → staging → prod` con gates de aprobación humana entre cada ambiente.
+
+**Qué hace, paso a paso:**
+1. **Job `approval-gate`**: Se bloquea esperando que un reviewer apruebe la promoción desde la UI de GitHub (configurado como GitHub Environment con reviewers requeridos)
+2. **Job `promote-iac`** o **`promote-container`**: Una vez aprobado, despliega el código IaC en el ambiente destino (Terraform/Bicep) **o** re-tagea y pushea la imagen Docker del ambiente origen al destino
+3. **Job `smoke-test-post-promotion`** (opcional): Si se provee `smoke-test-url`, verifica que el ambiente destino responde correctamente después de la promoción
+
+**Cuándo usarlo:** Como último job del pipeline de un PR mergeado a `main`, encadenado después de `iac-deployment-base.yml`.
+
+**Inputs principales:**
+| Input | Tipo | Requerido | Descripción |
+|---|---|---|---|
+| `promotion-type` | string | ✅ | `iac` o `container` |
+| `source-environment` | string | ✅ | Ambiente de origen ya validado |
+| `target-environment` | string | ✅ | Ambiente destino de la promoción |
+| `smoke-test-url` | string | | URL para verificar post-promoción |
+
+---
+
+#### `smoke-test-base.yml`
+**Propósito:** Verificar automáticamente que el sistema responde correctamente después de un despliegue o promoción.
+
+**Qué hace, paso a paso:**
+1. Espera N segundos configurables para que el deploy estabilice
+2. Itera sobre un array JSON de endpoints configurados y verifica: HTTP status correcto + tiempo de respuesta dentro del límite
+3. Publica una tabla de resultados en el Job Summary con status real, esperado y tiempo en ms por endpoint
+4. **Opcionalmente:** lanza un test de carga con **k6** con usuarios virtuales y duración configurables. Umbral automático: < 5% errores, p95 < 3000ms
+
+**Output disponible para encadenar:**
+| Output | Descripción |
+|---|---|
+| `smoke-test-passed` | `true` si todos los endpoints pasaron |
+
+**Inputs principales:**
+| Input | Tipo | Requerido | Descripción |
+|---|---|---|---|
+| `base-url` | string | ✅ | URL base del sistema (ej: `https://api.miapp.com`) |
+| `endpoints` | string | | JSON array de endpoints. Default: `[{"/health", GET, 200}]` |
+| `max-response-time-ms` | number | | Default: `3000` ms |
+| `run-load-test` | boolean | | Si `true`, lanza k6 |
+| `k6-vus` | number | | Usuarios virtuales simultáneos. Default: `10` |
+
+---
+
 ### Programados (`schedule`)
 
 ---
@@ -264,6 +335,49 @@ permissions:
 |---|---|---|
 | `scan-target` | `fs` / `image` | Qué escanear con Trivy |
 | `image-ref` | string | Referencia de imagen si `scan-target=image` |
+
+---
+
+#### `drift-detection-schedule.yml`
+**Cuándo corre:** **Lunes a viernes a las 07:00 UTC** (antes del horario laboral) + manual vía `workflow_dispatch`.
+
+**Qué hace, paso a paso:**
+1. Login a Azure con OIDC
+2. Corre `terraform plan -detailed-exitcode` contra la infraestructura real del ambiente configurado
+3. **Exit code 0** = sin drift → termina exitosamente
+4. **Exit code 2** = drift detectado → captura el output completo del plan
+5. Busca si ya existe un **GitHub Issue** abierto de drift para ese ambiente:
+   - Si existe: agrega un nuevo comentario con el diff actualizado
+   - Si no existe: abre un nuevo Issue con el reporte completo, los recursos afectados y las acciones recomendadas
+6. El Issue tiene labels `drift-detected`, `<ambiente>` e `infrastructure` para filtrado fácil
+
+**Parámetros del dispatch manual:**
+| Input | Opciones | Descripción |
+|---|---|---|
+| `working-directory` | string | Directorio del código Terraform |
+| `environment` | `dev` / `staging` / `prod` | Ambiente a verificar |
+
+---
+
+#### `stale-resources-schedule.yml`
+**Cuándo corre:** Cada **miércoles a las 09:00 UTC** + manual vía `workflow_dispatch`.
+
+**Qué hace, paso a paso:**
+1. Login a Azure con OIDC
+2. Ejecuta 5 escaneos en paralelo:
+   - **Discos**: sin VM asignada (`diskState == 'Unattached'`)
+   - **IPs públicas**: sin `ipConfiguration` (sin usar)
+   - **Snapshots**: creados hace más de N días (configurable, default 30)
+   - **Resource Groups**: sin ningún recurso adentro
+   - **Storage Accounts**: creados hace más de N días como proxy de inactividad
+3. Calcula el total de recursos encontrados
+4. Si hay recursos: cierra el Issue anterior de stale-resources (para no acumular) y abre uno nuevo con la lista detallada por tipo, labels `stale-resources`, `cost-optimization` e `infrastructure`
+
+**Parámetros del dispatch manual:**
+| Input | Opciones | Descripción |
+|---|---|---|
+| `dry-run` | `true` / `false` | Si `true`, solo reporta sin marcar para eliminación |
+| `days-threshold` | number | Días de umbral para considerar recurso huérfano |
 
 ---
 
@@ -475,6 +589,28 @@ az ad app federated-credential create \
 Este repositorio tiene Dependabot configurado para actualizar automáticamente las versiones de todas las GitHub Actions cada **lunes a las 9:00 AM (Argentina)**. Los PRs de actualización se crean con el label `dependencies` y se asignan para revisión.
 
 Esto garantiza que todos los proyectos que consumen estos pipelines siempre estén usando versiones seguras y actualizadas de las actions de la comunidad.
+
+---
+
+## Gobernanza del repositorio
+
+### CODEOWNERS
+El archivo `CODEOWNERS` en la raíz requiere que **@santiagodaros** apruebe cualquier cambio a workflows, Dependabot o documentación. Esto previene modificaciones no revisadas que afectarían a todos los repositorios consumidores.
+
+### Branch protection rules (configurar manualmente una sola vez)
+
+Ir a **Settings → Branches → Add rule** para la rama `main` y activar:
+
+| Regla | Valor | Por qué |
+|---|---|---|
+| Require a pull request before merging | ✅ | Nadie pushea directo a main |
+| Required approvals | `1` | Al menos 1 revisor humano |
+| Require review from Code Owners | ✅ | Fuerza revisión del CODEOWNERS |
+| Require status checks to pass | ✅ | Checks de CI deben estar verdes |
+| Do not allow bypassing the above settings | ✅ | Ni los admins saltean las reglas |
+| Restrict force pushes | ✅ | Previene reescritura del historial |
+
+> Sin estas reglas, los pipelines son buenos pero se pueden saltear con un push directo a `main`.
 
 ---
 

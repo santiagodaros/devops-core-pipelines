@@ -1,0 +1,185 @@
+# =============================================================================
+# Pipeline Base: Rollback de Emergencia (Reusable Workflow)
+# Disparador: workflow_call + workflow_dispatch (manual desde GitHub UI)
+# Propósito: Redesplegar la última versión estable conocida cuando un
+#            despliegue rompe producción. Reduce el MTTR a segundos.
+# =============================================================================
+name: "Base - Rollback de Emergencia"
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Ambiente a hacer rollback: dev, staging o prod"
+        required: true
+        type: string
+      target-tag:
+        description: "Tag git de la versión estable a restaurar (ej: v1.4.2). Vacío = último tag estable"
+        required: false
+        type: string
+        default: ""
+      iac-type:
+        description: "Tipo de IaC: bicep o terraform"
+        required: false
+        type: string
+        default: "terraform"
+      working-directory:
+        description: "Directorio del código IaC"
+        required: false
+        type: string
+        default: "."
+      azure-resource-group:
+        description: "Grupo de recursos Azure destino"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      AZURE_CLIENT_ID:
+        required: false
+      AZURE_TENANT_ID:
+        required: false
+      AZURE_SUBSCRIPTION_ID:
+        required: false
+    outputs:
+      rolled-back-to:
+        description: "Tag de versión al que se hizo rollback"
+        value: ${{ jobs.rollback.outputs.rolled-back-to }}
+
+  # También disparable manualmente desde la interfaz de GitHub en emergencias
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Ambiente a hacer rollback"
+        required: true
+        default: "prod"
+        type: choice
+        options: [dev, staging, prod]
+      target-tag:
+        description: "Tag a restaurar (vacío = último tag estable automáticamente)"
+        required: false
+        type: string
+        default: ""
+      iac-type:
+        description: "Tipo de IaC"
+        required: false
+        default: "terraform"
+        type: choice
+        options: [terraform, bicep]
+      working-directory:
+        description: "Directorio del código IaC"
+        required: false
+        default: "."
+        type: string
+      azure-resource-group:
+        description: "Grupo de recursos Azure destino"
+        required: false
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  rollback:
+    name: "🚨 Rollback → ${{ inputs.environment }}"
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}   # Requiere aprobación del environment en GitHub
+    outputs:
+      rolled-back-to: ${{ steps.resolve-tag.outputs.tag }}
+    steps:
+      - name: "Checkout del repositorio (historial completo para resolver tags)"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: "Resolver tag de destino del rollback"
+        id: resolve-tag
+        run: |
+          TARGET="${{ inputs.target-tag }}"
+
+          if [ -z "$TARGET" ]; then
+            # Sin tag especificado → buscar el penúltimo tag estable (el anterior al actual)
+            TAGS=$(git tag --sort=-version:refname | grep -E "^v[0-9]+\.[0-9]+\.[0-9]+$")
+            CURRENT=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+            if [ -z "$CURRENT" ]; then
+              echo "❌ No se encontraron tags de versión en el repositorio."
+              exit 1
+            fi
+            # Tomar el segundo tag (el penúltimo, que es el anterior al actual)
+            TARGET=$(echo "$TAGS" | sed -n '2p')
+            if [ -z "$TARGET" ]; then
+              echo "❌ Solo existe un tag. No hay versión previa a la que hacer rollback."
+              exit 1
+            fi
+            echo "Tag actual: $CURRENT → Rollback a: $TARGET"
+          fi
+
+          echo "tag=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "✅ Haciendo rollback a la versión: $TARGET"
+
+      - name: "Checkout del código en el tag de rollback"
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.resolve-tag.outputs.tag }}
+
+      - name: "Login a Azure con OIDC"
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # -----------------------------------------------------------------------
+      # Rollback Terraform
+      # -----------------------------------------------------------------------
+      - name: "Configurar Terraform"
+        if: inputs.iac-type == 'terraform'
+        uses: hashicorp/setup-terraform@v3
+
+      - name: "Terraform Init"
+        if: inputs.iac-type == 'terraform'
+        working-directory: ${{ inputs.working-directory }}
+        run: terraform init
+
+      - name: "Terraform Apply — restaurar versión ${{ steps.resolve-tag.outputs.tag }}"
+        if: inputs.iac-type == 'terraform'
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          echo "🚨 ROLLBACK: aplicando versión ${{ steps.resolve-tag.outputs.tag }} en ${{ inputs.environment }}"
+          terraform apply -auto-approve \
+            -var="environment=${{ inputs.environment }}"
+
+      # -----------------------------------------------------------------------
+      # Rollback Bicep
+      # -----------------------------------------------------------------------
+      - name: "Instalar Bicep CLI"
+        if: inputs.iac-type == 'bicep'
+        run: az bicep install
+
+      - name: "Bicep Deploy — restaurar versión ${{ steps.resolve-tag.outputs.tag }}"
+        if: inputs.iac-type == 'bicep'
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          TEMPLATE=$(find . -name "main.bicep" | head -1)
+          echo "🚨 ROLLBACK: desplegando $TEMPLATE en ${{ inputs.azure-resource-group }}"
+          az deployment group create \
+            --name "rollback-${{ steps.resolve-tag.outputs.tag }}-$(date +%Y%m%d%H%M%S)" \
+            --resource-group "${{ inputs.azure-resource-group }}" \
+            --template-file "$TEMPLATE" \
+            --parameters environment="${{ inputs.environment }}"
+
+      - name: "Generar Job Summary del rollback"
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          ICON=$([ "$STATUS" = "success" ] && echo "✅" || echo "❌")
+          echo "## 🚨 Rollback de Emergencia" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Campo | Valor |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Resultado | $ICON $STATUS |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Ambiente | \`${{ inputs.environment }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Versión restaurada | \`${{ steps.resolve-tag.outputs.tag }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Tipo IaC | \`${{ inputs.iac-type }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Ejecutado por | @${{ github.actor }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Timestamp | $(date -u '+%Y-%m-%d %H:%M UTC') |" >> "$GITHUB_STEP_SUMMARY"

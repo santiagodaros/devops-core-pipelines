@@ -1,0 +1,225 @@
+# =============================================================================
+# Pipeline Programado: Recursos Huérfanos en la Nube
+# Disparador: Cron (miércoles 09:00 UTC) + workflow_dispatch (manual)
+# Propósito: Detectar recursos de Azure sin uso que generan costo innecesario:
+#            discos sin VM, IPs públicas sin asignar, snapshots viejos,
+#            resource groups vacíos y storage accounts sin acceso reciente.
+#            Genera un reporte como GitHub Issue con el costo estimado.
+# =============================================================================
+name: "Scheduled - Recursos Huérfanos en la Nube"
+
+on:
+  schedule:
+    - cron: "0 9 * * 3"   # Cada miércoles a las 09:00 UTC
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Solo reportar, no marcar recursos para eliminación"
+        required: false
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      days-threshold:
+        description: "Días sin uso para considerar un recurso como huérfano"
+        required: false
+        default: "30"
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+
+env:
+  DAYS_THRESHOLD: ${{ github.event.inputs.days-threshold || '30' }}
+  DRY_RUN: ${{ github.event.inputs.dry-run || 'true' }}
+
+jobs:
+  scan-stale-resources:
+    name: "Escanear recursos huérfanos en Azure"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Login a Azure con OIDC"
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: "Detectar discos sin VM asignada"
+        id: orphan-disks
+        run: |
+          echo "Buscando discos sin VM..."
+          DISKS=$(az disk list \
+            --query "[?diskState=='Unattached'].{name:name, rg:resourceGroup, size:diskSizeGB, sku:sku.name}" \
+            --output json)
+          COUNT=$(echo "$DISKS" | jq length)
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "$DISKS" > /tmp/orphan-disks.json
+          echo "Discos huérfanos encontrados: $COUNT"
+
+      - name: "Detectar IPs públicas sin asignar"
+        id: orphan-ips
+        run: |
+          echo "Buscando IPs públicas sin asignar..."
+          IPS=$(az network public-ip list \
+            --query "[?ipConfiguration==null].{name:name, rg:resourceGroup, sku:sku.name, ip:ipAddress}" \
+            --output json)
+          COUNT=$(echo "$IPS" | jq length)
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "$IPS" > /tmp/orphan-ips.json
+          echo "IPs huérfanas encontradas: $COUNT"
+
+      - name: "Detectar snapshots con más de ${{ env.DAYS_THRESHOLD }} días"
+        id: old-snapshots
+        run: |
+          echo "Buscando snapshots viejos..."
+          CUTOFF=$(date -d "-${{ env.DAYS_THRESHOLD }} days" +%Y-%m-%dT%H:%M:%SZ)
+          SNAPSHOTS=$(az snapshot list \
+            --query "[?timeCreated<'$CUTOFF'].{name:name, rg:resourceGroup, size:diskSizeGB, created:timeCreated}" \
+            --output json)
+          COUNT=$(echo "$SNAPSHOTS" | jq length)
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "$SNAPSHOTS" > /tmp/old-snapshots.json
+          echo "Snapshots viejos encontrados: $COUNT"
+
+      - name: "Detectar Resource Groups vacíos"
+        id: empty-rgs
+        run: |
+          echo "Buscando resource groups vacíos..."
+          EMPTY_RGS=()
+          while IFS= read -r rg; do
+            COUNT=$(az resource list --resource-group "$rg" --query "length(@)" --output tsv 2>/dev/null || echo "0")
+            if [ "$COUNT" -eq 0 ]; then
+              EMPTY_RGS+=("$rg")
+            fi
+          done < <(az group list --query "[].name" --output tsv)
+          COUNT=${#EMPTY_RGS[@]}
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "${EMPTY_RGS[@]}" | jq -R -s 'split("\n") | map(select(length > 0))' > /tmp/empty-rgs.json
+          echo "Resource Groups vacíos encontrados: $COUNT"
+
+      - name: "Detectar Storage Accounts sin acceso reciente"
+        id: stale-storage
+        run: |
+          echo "Buscando storage accounts sin acceso reciente..."
+          CUTOFF=$(date -d "-${{ env.DAYS_THRESHOLD }} days" +%Y-%m-%dT%H:%M:%SZ)
+          STORAGE=$(az storage account list \
+            --query "[].{name:name, rg:resourceGroup, kind:kind, sku:sku.name, created:creationTime}" \
+            --output json)
+
+          # Filtrar por fecha de creación como proxy de actividad
+          STALE=$(echo "$STORAGE" | jq --arg cutoff "$CUTOFF" '[.[] | select(.created < $cutoff)]')
+          COUNT=$(echo "$STALE" | jq length)
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "$STALE" > /tmp/stale-storage.json
+          echo "Storage accounts candidatos encontrados: $COUNT"
+
+      - name: "Calcular resumen total"
+        id: summary
+        run: |
+          DISKS=$(cat /tmp/orphan-disks.json | jq length)
+          IPS=$(cat /tmp/orphan-ips.json | jq length)
+          SNAPS=$(cat /tmp/old-snapshots.json | jq length)
+          RGS=$(cat /tmp/empty-rgs.json | jq length)
+          STORAGE=$(cat /tmp/stale-storage.json | jq length)
+          TOTAL=$((DISKS + IPS + SNAPS + RGS + STORAGE))
+
+          echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
+          echo "disks=$DISKS"   >> "$GITHUB_OUTPUT"
+          echo "ips=$IPS"       >> "$GITHUB_OUTPUT"
+          echo "snaps=$SNAPS"   >> "$GITHUB_OUTPUT"
+          echo "rgs=$RGS"       >> "$GITHUB_OUTPUT"
+          echo "storage=$STORAGE" >> "$GITHUB_OUTPUT"
+
+          echo "## 🗑️ Recursos Huérfanos — Resumen" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Tipo de recurso | Cantidad |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Discos sin VM | $DISKS |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| IPs públicas sin asignar | $IPS |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Snapshots > ${{ env.DAYS_THRESHOLD }} días | $SNAPS |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Resource Groups vacíos | $RGS |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Storage Accounts candidatos | $STORAGE |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **TOTAL** | **$TOTAL** |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "_Umbral de inactividad: ${{ env.DAYS_THRESHOLD }} días_" >> "$GITHUB_STEP_SUMMARY"
+          echo "_Ejecutado: $(date -u '+%Y-%m-%d %H:%M UTC')_" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "Abrir GitHub Issue con el reporte de recursos huérfanos"
+        if: steps.summary.outputs.total != '0'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const today  = new Date().toISOString().slice(0,10);
+
+            const disks   = JSON.parse(fs.readFileSync('/tmp/orphan-disks.json',   'utf8'));
+            const ips     = JSON.parse(fs.readFileSync('/tmp/orphan-ips.json',     'utf8'));
+            const snaps   = JSON.parse(fs.readFileSync('/tmp/old-snapshots.json',  'utf8'));
+            const rgs     = JSON.parse(fs.readFileSync('/tmp/empty-rgs.json',      'utf8'));
+            const storage = JSON.parse(fs.readFileSync('/tmp/stale-storage.json',  'utf8'));
+
+            const fmt = (arr) => arr.length
+              ? arr.map(r => `- \`${r.name || r}\` (RG: ${r.rg || 'N/A'})`).join('\n')
+              : '_Ninguno_';
+
+            const body = `## 🗑️ Reporte de Recursos Huérfanos — ${today}
+
+            Se detectaron **${{ steps.summary.outputs.total }} recursos** en Azure que podrían eliminarse para reducir costos.
+
+            | Tipo | Cantidad |
+            |---|---|
+            | Discos sin VM | ${{ steps.summary.outputs.disks }} |
+            | IPs públicas sin asignar | ${{ steps.summary.outputs.ips }} |
+            | Snapshots > ${{ env.DAYS_THRESHOLD }} días | ${{ steps.summary.outputs.snaps }} |
+            | Resource Groups vacíos | ${{ steps.summary.outputs.rgs }} |
+            | Storage Accounts candidatos | ${{ steps.summary.outputs.storage }} |
+
+            ### Discos sin VM asignada
+            ${fmt(disks)}
+
+            ### IPs públicas sin asignar
+            ${fmt(ips)}
+
+            ### Snapshots con más de ${{ env.DAYS_THRESHOLD }} días
+            ${fmt(snaps)}
+
+            ### Resource Groups vacíos
+            ${rgs.map(r => `- \`${r}\``).join('\n') || '_Ninguno_'}
+
+            ### Storage Accounts candidatos
+            ${fmt(storage)}
+
+            ---
+            **Modo:** \`${{ env.DRY_RUN == 'true' && 'Reporte (sin cambios)' || 'Activo' }}\`
+            **Umbral:** ${{ env.DAYS_THRESHOLD }} días sin uso
+            **Run completo:** [Ver detalles](${runUrl})
+
+            _Generado automáticamente por [devops-core-pipelines](https://github.com/santiagodaros/devops-core-pipelines)_`;
+
+            // Cerrar issue anterior del mismo tipo si existe
+            const { data: openIssues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              state: 'open',
+              labels: 'stale-resources'
+            });
+            for (const issue of openIssues) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed'
+              });
+            }
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              title: `🗑️ Recursos huérfanos detectados — ${today} (${{ steps.summary.outputs.total }} recursos)`,
+              body,
+              labels: ['stale-resources', 'cost-optimization', 'infrastructure']
+            });

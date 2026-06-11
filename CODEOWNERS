@@ -1,0 +1,21 @@
+# CODEOWNERS — devops-core-pipelines
+#
+# Cualquier cambio en los workflows centrales requiere aprobación del equipo
+# de Platform Engineering. Esto previene modificaciones no revisadas que
+# afectarían a todos los repositorios que consumen estos pipelines.
+#
+# Formato: <patrón>  <@usuario o @org/equipo>
+# Docs: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Propietario global del repositorio
+*                                   @santiagodaros
+
+# Workflows — requieren revisión en cualquier cambio
+.github/workflows/                  @santiagodaros
+
+# Dependabot — requiere revisión para cambiar el schedule
+.github/dependabot.yml              @santiagodaros
+
+# Documentación
+README.md                           @santiagodaros
+CODEOWNERS                          @santiagodaros

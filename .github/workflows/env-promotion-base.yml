@@ -1,0 +1,200 @@
+# =============================================================================
+# Pipeline Base: Promoción entre Ambientes (Reusable Workflow)
+# Disparador: workflow_call (invocado desde repositorios esclavos)
+# Propósito: Formaliza el flujo dev → staging → prod con gates de aprobación
+#            manual entre ambientes configurados como GitHub Environments.
+#            Soporta promoción de IaC (Terraform/Bicep) e imágenes Docker.
+# =============================================================================
+name: "Base - Promoción entre Ambientes"
+
+on:
+  workflow_call:
+    inputs:
+      promotion-type:
+        description: "Qué se está promoviendo: 'iac' o 'container'"
+        required: true
+        type: string
+      source-environment:
+        description: "Ambiente de origen (ya desplegado y validado)"
+        required: true
+        type: string
+      target-environment:
+        description: "Ambiente destino de la promoción"
+        required: true
+        type: string
+      iac-type:
+        description: "Tipo de IaC: terraform o bicep (solo si promotion-type=iac)"
+        required: false
+        type: string
+        default: "terraform"
+      working-directory:
+        description: "Directorio del código IaC (solo si promotion-type=iac)"
+        required: false
+        type: string
+        default: "."
+      azure-resource-group:
+        description: "Grupo de recursos del ambiente destino"
+        required: false
+        type: string
+        default: ""
+      image-name:
+        description: "Nombre de la imagen a promover (solo si promotion-type=container)"
+        required: false
+        type: string
+        default: ""
+      image-tag:
+        description: "Tag de la imagen a promover (ej: sha-abc1234)"
+        required: false
+        type: string
+        default: ""
+      registry:
+        description: "Registry donde está la imagen: ghcr, acr o ecr"
+        required: false
+        type: string
+        default: "ghcr"
+      smoke-test-url:
+        description: "URL base para smoke test post-deploy (opcional)"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      AZURE_CLIENT_ID:
+        required: false
+      AZURE_TENANT_ID:
+        required: false
+      AZURE_SUBSCRIPTION_ID:
+        required: false
+
+permissions:
+  id-token: write
+  contents: read
+  packages: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Gate de aprobación manual — requiere que el target-environment tenga
+  # reviewers configurados en GitHub → Settings → Environments
+  # ---------------------------------------------------------------------------
+  approval-gate:
+    name: "⏳ Esperando aprobación para promover a ${{ inputs.target-environment }}"
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.target-environment }}   # <-- aquí se bloquea hasta aprobación
+    steps:
+      - name: "Aprobación recibida"
+        run: |
+          echo "✅ Promoción a ${{ inputs.target-environment }} aprobada por @${{ github.actor }}"
+          echo "Origen: ${{ inputs.source-environment }} → Destino: ${{ inputs.target-environment }}"
+
+  # ---------------------------------------------------------------------------
+  # Promoción de IaC
+  # ---------------------------------------------------------------------------
+  promote-iac:
+    name: "Promover IaC → ${{ inputs.target-environment }}"
+    if: inputs.promotion-type == 'iac'
+    needs: approval-gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout del código fuente"
+        uses: actions/checkout@v4
+
+      - name: "Login a Azure con OIDC"
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: "Configurar Terraform"
+        if: inputs.iac-type == 'terraform'
+        uses: hashicorp/setup-terraform@v3
+
+      - name: "Terraform Init + Apply en ${{ inputs.target-environment }}"
+        if: inputs.iac-type == 'terraform'
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          terraform init
+          terraform apply -auto-approve \
+            -var="environment=${{ inputs.target-environment }}"
+
+      - name: "Instalar Bicep CLI"
+        if: inputs.iac-type == 'bicep'
+        run: az bicep install
+
+      - name: "Bicep Deploy en ${{ inputs.target-environment }}"
+        if: inputs.iac-type == 'bicep'
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          TEMPLATE=$(find . -name "main.bicep" | head -1)
+          az deployment group create \
+            --name "promotion-${{ inputs.source-environment }}-to-${{ inputs.target-environment }}-$(date +%Y%m%d%H%M%S)" \
+            --resource-group "${{ inputs.azure-resource-group }}" \
+            --template-file "$TEMPLATE" \
+            --parameters environment="${{ inputs.target-environment }}"
+
+  # ---------------------------------------------------------------------------
+  # Promoción de imagen Docker (re-tag y push al ambiente destino)
+  # ---------------------------------------------------------------------------
+  promote-container:
+    name: "Promover imagen → ${{ inputs.target-environment }}"
+    if: inputs.promotion-type == 'container'
+    needs: approval-gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Login a GHCR"
+        if: inputs.registry == 'ghcr'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: "Pull de la imagen desde ${{ inputs.source-environment }}"
+        run: |
+          SOURCE_IMAGE="ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}:${{ inputs.image-tag }}"
+          TARGET_IMAGE="ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}:${{ inputs.target-environment }}"
+          echo "Promoviendo: $SOURCE_IMAGE → $TARGET_IMAGE"
+          docker pull "$SOURCE_IMAGE"
+          docker tag  "$SOURCE_IMAGE" "$TARGET_IMAGE"
+          docker push "$TARGET_IMAGE"
+          echo "✅ Imagen promovida correctamente a ${{ inputs.target-environment }}"
+
+  # ---------------------------------------------------------------------------
+  # Smoke test post-promoción (si se configuró una URL)
+  # ---------------------------------------------------------------------------
+  smoke-test-post-promotion:
+    name: "Smoke test post-promoción en ${{ inputs.target-environment }}"
+    if: inputs.smoke-test-url != ''
+    needs: [promote-iac, promote-container]
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Esperar que el ambiente esté listo (60s)"
+        run: sleep 60
+
+      - name: "Verificar respuesta del ambiente"
+        run: |
+          URL="${{ inputs.smoke-test-url }}"
+          echo "Verificando: $URL"
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$URL")
+          if [ "$STATUS" -ge 200 ] && [ "$STATUS" -lt 400 ]; then
+            echo "✅ ${{ inputs.target-environment }} responde correctamente (HTTP $STATUS)"
+          else
+            echo "❌ ${{ inputs.target-environment }} no responde como se esperaba (HTTP $STATUS)"
+            exit 1
+          fi
+
+  summary:
+    name: "Resumen de promoción"
+    if: always()
+    needs: [promote-iac, promote-container, smoke-test-post-promotion]
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Generar Job Summary"
+        run: |
+          echo "## 🚀 Promoción de Ambiente" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Campo | Valor |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Flujo | \`${{ inputs.source-environment }}\` → \`${{ inputs.target-environment }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Tipo | \`${{ inputs.promotion-type }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Aprobado por | @${{ github.actor }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Timestamp | $(date -u '+%Y-%m-%d %H:%M UTC') |" >> "$GITHUB_STEP_SUMMARY"
