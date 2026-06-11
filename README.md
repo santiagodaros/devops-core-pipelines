@@ -1,147 +1,480 @@
 # devops-core-pipelines
 
-Repositorio centralizado de **pipelines base reutilizables** para GitHub Actions. Actúa como la fuente única de verdad para los workflows de CI/CD compartidos por todos los proyectos de la organización, siguiendo el patrón de **Reusable Workflows** de GitHub.
+Repositorio centralizado de **pipelines base reutilizables** para GitHub Actions. Actúa como la fuente única de verdad para todos los workflows de CI/CD de la organización, siguiendo el patrón de **Reusable Workflows** de GitHub.
+
+Cualquier repositorio de proyecto puede invocar estos pipelines con una sola línea usando `uses:`, sin copiar ni mantener lógica de CI/CD propia.
 
 ---
 
-## Estructura del repositorio
+## Índice
+
+- [Arquitectura](#arquitectura)
+- [Catálogo de pipelines](#catálogo-de-pipelines)
+  - [Reutilizables (workflow_call)](#reutilizables-workflow_call)
+  - [Programados (schedule)](#programados-schedule)
+- [Patrones de encadenamiento](#patrones-de-encadenamiento)
+- [Configuración de secretos](#configuración-de-secretos)
+- [Cómo invocar un pipeline desde tu proyecto](#cómo-invocar-un-pipeline-desde-tu-proyecto)
+- [Mantenimiento automático (Dependabot)](#mantenimiento-automático-dependabot)
+
+---
+
+## Arquitectura
 
 ```
-devops-core-pipelines/
-├── .github/
-│   └── workflows/
-│       ├── script-validation-base.yml   # Calidad de scripts PowerShell + escaneo de secretos
-│       ├── iac-simulation-base.yml      # Validación sintáctica y simulación What-If/Plan
-│       ├── iac-deployment-base.yml      # Despliegue seguro con identidades federadas (OIDC)
-│       ├── tf-development-helper.yml    # fmt + TFLint + terraform-docs con auto-commit
-│       ├── repo-deep-audit-schedule.yml # Auditoría semanal (Super-Linter + Trivy)
-│       └── cloud-janitor-schedule.yml   # Apagado automático de VMs de desarrollo
-├── README.md
-└── .gitignore
+┌─────────────────────────────────────────────────────────┐
+│              devops-core-pipelines (este repo)          │
+│                                                         │
+│  ┌─────────────────────┐   ┌─────────────────────────┐  │
+│  │  REUTILIZABLES       │   │  PROGRAMADOS            │  │
+│  │  (workflow_call)     │   │  (schedule)             │  │
+│  │                     │   │                         │  │
+│  │  pr-validation      │   │  repo-deep-audit        │  │
+│  │  script-validation  │   │  cloud-janitor          │  │
+│  │  iac-simulation     │   └─────────────────────────┘  │
+│  │  iac-deployment     │                                 │
+│  │  tf-dev-helper      │                                 │
+│  │  cost-estimation    │                                 │
+│  │  container-build    │                                 │
+│  │  release            │                                 │
+│  └──────────┬──────────┘                                 │
+└─────────────┼───────────────────────────────────────────┘
+              │ uses: santiagodaros/devops-core-pipelines/...@main
+              │
+   ┌──────────▼──────────┐    ┌────────────────────────┐
+   │  repo-proyecto-a    │    │  repo-proyecto-b        │
+   │  .github/workflows/ │    │  .github/workflows/     │
+   │  └── ci.yml         │    │  └── ci.yml             │
+   └─────────────────────┘    └────────────────────────┘
+```
+
+Los pipelines programados (`schedule`) solo se ejecutan en **este repositorio**.
+Los pipelines reutilizables (`workflow_call`) se invocan desde **cualquier repositorio de proyecto**.
+
+---
+
+## Catálogo de pipelines
+
+### Reutilizables (`workflow_call`)
+
+---
+
+#### `pr-validation-base.yml`
+**Propósito:** Validación integral de calidad en Pull Requests con reporte automático como comentario en el PR.
+
+**Qué hace, paso a paso:**
+1. Instala PSScriptAnalyzer en PowerShell Core
+2. Escanea todos los `.ps1` del directorio configurado buscando aliases prohibidos, malas prácticas y violaciones de estilo
+3. Corre Gitleaks sobre el historial completo del PR buscando secretos, tokens y credenciales expuestas
+4. Publica un **comentario consolidado en el PR** con una tabla de resultados (✅/❌ por check). Si el comentario ya existe de una ejecución anterior, lo **actualiza** en lugar de duplicarlo
+
+**Cuándo usarlo:** En cualquier workflow disparado por `pull_request`. Es el primer gate de calidad antes de que el código llegue a revisión humana.
+
+**Inputs principales:**
+| Input | Tipo | Default | Descripción |
+|---|---|---|---|
+| `scripts-directory` | string | `.` | Directorio con los `.ps1` a analizar |
+| `fail-on-warnings` | boolean | `false` | Si `true`, los warnings también bloquean el PR |
+
+**Permisos requeridos en el job caller:**
+```yaml
+permissions:
+  pull-requests: write
 ```
 
 ---
 
-## Pipelines disponibles
+#### `script-validation-base.yml`
+**Propósito:** Análisis de calidad y seguridad de scripts PowerShell, pensado para runs en cualquier rama (no solo PRs).
 
-### 🔧 Pipelines Reutilizables (`workflow_call`)
+**Qué hace, paso a paso:**
+1. **Job `psscriptanalyzer`** (windows-latest): Instala PSScriptAnalyzer, descubre todos los `.ps1` recursivamente y los analiza buscando errores y warnings. Falla el pipeline si encuentra problemas
+2. **Job `secret-scan`** (ubuntu-latest): Hace checkout con historial completo y corre Gitleaks. Guarda los resultados como artefacto SARIF
 
-Estos pipelines son **"Skills" interconectables**: se invocan desde los workflows de otros repositorios usando la propiedad `uses:`. No se ejecutan solos.
+**Diferencia con `pr-validation-base.yml`:** Este pipeline no publica comentarios en PRs; solo pasa o falla el job. Ideal para branches de trabajo donde no hay PR abierto todavía.
 
-| Archivo | Propósito |
+**Inputs principales:**
+| Input | Tipo | Default | Descripción |
+|---|---|---|---|
+| `working-directory` | string | `.` | Directorio raíz de los scripts |
+| `fail-on-secrets` | boolean | `true` | Si `false`, Gitleaks reporta pero no bloquea |
+
+---
+
+#### `iac-simulation-base.yml`
+**Propósito:** Validar el código de infraestructura (Bicep o Terraform) y detectar problemas de seguridad **antes** de cualquier despliegue real.
+
+**Qué hace, paso a paso:**
+
+*Para `iac-type: bicep`:*
+1. Login a Azure con OIDC (sin credenciales estáticas)
+2. Instala Bicep CLI y compila todos los `.bicep` del directorio para validar sintaxis
+3. Si se provee `azure-resource-group`, ejecuta `az deployment group what-if` mostrando exactamente qué cambiaría en Azure sin aplicar nada
+
+*Para `iac-type: terraform`:*
+1. Corre `terraform init -backend=false` para resolver providers sin conectarse al backend remoto
+2. Ejecuta `terraform validate` para verificar sintaxis y coherencia interna
+3. Ejecuta `terraform fmt -check` para verificar que el formato sea correcto
+
+*Para ambos tipos (job paralelo):*
+4. **Job `checkov-security`**: Escanea el código IaC con Checkov buscando configuraciones inseguras (recursos sin cifrado, puertos abiertos, storage público, etc.). Publica los resultados en la pestaña **Security → Code scanning** del repositorio vía SARIF
+
+**Cuándo usarlo:** En PRs que modifiquen código de infraestructura. Debe correr **antes** de `iac-deployment-base.yml`.
+
+**Inputs principales:**
+| Input | Tipo | Requerido | Descripción |
+|---|---|---|---|
+| `iac-type` | string | ✅ | `bicep` o `terraform` |
+| `working-directory` | string | | Directorio del código IaC |
+| `azure-resource-group` | string | | Para ejecutar What-If (solo Bicep) |
+| `checkov-skip-checks` | string | | IDs a ignorar, ej: `CKV_AZURE_1,CKV_AZURE_2` |
+| `fail-on-checkov-errors` | boolean | | Default `true` |
+
+---
+
+#### `iac-deployment-base.yml`
+**Propósito:** Desplegar infraestructura real en Azure o AWS usando **identidades federadas OIDC** — sin ningún secreto de larga duración en el repositorio.
+
+**Qué hace, paso a paso:**
+1. Checkout del código
+2. Autentica en Azure (OIDC) o AWS (OIDC) según `cloud-provider`
+3. *Para Bicep:* Instala Bicep CLI y ejecuta `az deployment group create` con timestamp en el nombre para trazabilidad
+4. *Para Terraform:* Ejecuta `terraform init` + `terraform apply -auto-approve` pasando el ambiente como variable
+
+**Cuándo usarlo:** Solo en la rama `main` o en workflows con aprobación manual configurada como **GitHub Environment** (con reviewers requeridos).
+
+**Inputs principales:**
+| Input | Tipo | Requerido | Descripción |
+|---|---|---|---|
+| `cloud-provider` | string | ✅ | `azure` o `aws` |
+| `iac-type` | string | ✅ | `bicep` o `terraform` |
+| `environment` | string | ✅ | `dev`, `staging` o `prod` |
+| `azure-resource-group` | string | | Grupo de recursos destino |
+
+> **Prerequisito:** Debe haber corrido `iac-simulation-base.yml` y estar aprobado antes de invocar este pipeline.
+
+---
+
+#### `tf-development-helper.yml`
+**Propósito:** Asistente automático de calidad para desarrolladores de Terraform. Corrige el código y genera documentación sin intervención manual.
+
+**Qué hace, paso a paso:**
+1. **Job `tf-format`**: Restaura caché de providers → corre `terraform fmt -recursive` → si hay cambios, sube los archivos formateados como artefacto
+2. **Job `tf-lint`** (necesita `tf-format`): Restaura caché → instala TFLint → inicializa plugins → corre `tflint --recursive`. Reporta hallazgos pero puede configurarse para no bloquear
+3. **Job `tf-docs`** (necesita `tf-lint`): Corre `terraform-docs` e inyecta la documentación generada (variables, outputs, recursos) entre los marcadores `<!-- BEGIN_TF_DOCS -->` y `<!-- END_TF_DOCS -->` del `README.md`. Hace **auto-commit** con todos los cambios directamente a la rama del proyecto
+
+**Resultado visible:** Un commit nuevo firmado por `github-actions[bot]` con el código formateado y el README actualizado.
+
+**Prerequisito en el README del módulo Terraform:**
+```markdown
+<!-- BEGIN_TF_DOCS -->
+<!-- END_TF_DOCS -->
+```
+
+**Permisos requeridos en el job caller:**
+```yaml
+permissions:
+  contents: write
+```
+
+---
+
+#### `cost-estimation-base.yml`
+**Propósito:** Calcular el impacto económico de un PR de Terraform antes de aprobarlo.
+
+**Qué hace, paso a paso:**
+1. Hace checkout de la rama **base** del PR (el estado actual)
+2. Hace checkout de la rama **head** del PR (los cambios propuestos)
+3. Corre `infracost breakdown` en ambas versiones para obtener el costo mensual de cada una
+4. Corre `infracost diff` para calcular el **delta**: cuánto más (o menos) va a costar la infraestructura si se mergea el PR
+5. Publica el reporte de costos como **comentario en el PR**, actualizándolo en cada nuevo push
+
+**Prerequisito:** Configurar el secret `INFRACOST_API_KEY` (cuenta gratuita en [infracost.io](https://www.infracost.io)).
+
+**Inputs principales:**
+| Input | Tipo | Default | Descripción |
+|---|---|---|---|
+| `working-directory` | string | `.` | Directorio del código Terraform |
+| `currency` | string | `USD` | Moneda del reporte |
+
+---
+
+#### `container-build-base.yml`
+**Propósito:** Construir, escanear y publicar imágenes Docker de forma segura en el registry configurado.
+
+**Qué hace, paso a paso:**
+1. Autentica en el registry seleccionado (GHCR con `GITHUB_TOKEN`, ACR con OIDC, o ECR con OIDC)
+2. Configura QEMU y Docker Buildx para builds multi-plataforma
+3. Genera tags automáticos: por branch, por PR, semánticos (`v1.2.3`, `v1.2`) y por SHA corto
+4. Construye la imagen con caché de GitHub Actions (`type=gha`) para acelerar builds sucesivos
+5. **Escanea la imagen con Trivy** buscando CVEs. Publica resultados en Security → Code scanning
+6. **Solo si Trivy pasa:** hace push de la imagen al registry. Si hay vulnerabilidades críticas, el push está bloqueado
+
+**Inputs principales:**
+| Input | Tipo | Requerido | Descripción |
+|---|---|---|---|
+| `image-name` | string | ✅ | Nombre de la imagen sin prefijo de registry |
+| `registry` | string | | `ghcr` (default), `acr` o `ecr` |
+| `severity-threshold` | string | | `CRITICAL` (default), `HIGH`, `MEDIUM` |
+| `platforms` | string | | `linux/amd64` (default), o `linux/amd64,linux/arm64` |
+
+---
+
+#### `release-base.yml`
+**Propósito:** Automatizar completamente el ciclo de versioning: análisis de commits → bump de versión → CHANGELOG → tag → GitHub Release.
+
+**Qué hace, paso a paso:**
+1. Analiza los mensajes de commit desde el último tag usando **Conventional Commits**:
+   - `feat:` → bump **MINOR** (v1.1.0)
+   - `fix:` / `perf:` → bump **PATCH** (v1.0.1)
+   - `feat!:` o `BREAKING CHANGE` → bump **MAJOR** (v2.0.0)
+   - `chore:` / `docs:` / `refactor:` → sin release
+2. Si hay commits relevantes: actualiza `CHANGELOG.md`, crea el tag git (`v1.2.3`), hace commit del CHANGELOG y publica el **GitHub Release** con las release notes generadas automáticamente
+3. Si no hay commits relevantes: termina silenciosamente sin crear release
+
+**Outputs disponibles para encadenar:**
+| Output | Descripción |
 |---|---|
-| `script-validation-base.yml` | Analiza scripts `.ps1` con PSScriptAnalyzer y escanea secretos con Gitleaks |
-| `iac-simulation-base.yml` | Valida sintaxis Bicep/Terraform y ejecuta `What-If` o `terraform plan` |
-| `iac-deployment-base.yml` | Despliega IaC en Azure o AWS usando OIDC (sin secretos estáticos) |
-| `tf-development-helper.yml` | Formatea con `terraform fmt`, analiza con TFLint, genera docs con terraform-docs y hace auto-commit |
+| `version` | Versión publicada, ej: `1.2.3` |
+| `released` | `true` si se creó un nuevo release |
 
-### ⏰ Pipelines Programados (`schedule`)
+**Cuándo usarlo:** Solo en push a `main`, después de mergear un PR.
 
-Se ejecutan automáticamente según el horario configurado. También pueden lanzarse manualmente con `workflow_dispatch`.
-
-| Archivo | Horario | Propósito |
-|---|---|---|
-| `repo-deep-audit-schedule.yml` | Viernes 18:00 UTC | Super-Linter + Trivy sobre todo el repositorio |
-| `cloud-janitor-schedule.yml` | Lun-Vie 20:00 UTC | Apaga VMs etiquetadas como `environment=dev` en Azure |
+**Permisos requeridos en el job caller:**
+```yaml
+permissions:
+  contents: write
+```
 
 ---
 
-## Cómo usar los pipelines reutilizables desde tu proyecto
+### Programados (`schedule`)
 
-Desde cualquier repositorio de tu organización, crea un archivo `.github/workflows/ci.yml` e invoca el pipeline base usando `uses:`:
+---
+
+#### `repo-deep-audit-schedule.yml`
+**Cuándo corre:** Cada **viernes a las 18:00 UTC** (automático) + manual vía `workflow_dispatch`.
+
+**Qué hace, paso a paso:**
+1. **Job `super-linter`**: Corre Super-Linter sobre todo el repositorio validando YAML, Bash, PowerShell, Terraform, JSON y Markdown simultáneamente. Reporta todos los problemas de estilo y calidad en el log del job
+2. **Job `trivy-scan`**: Escanea el filesystem completo (o una imagen Docker si se especifica manualmente) con Trivy buscando dependencias con CVEs conocidos. Publica resultados en Security → Code scanning vía SARIF
+
+**Parámetros del dispatch manual:**
+| Input | Opciones | Descripción |
+|---|---|---|
+| `scan-target` | `fs` / `image` | Qué escanear con Trivy |
+| `image-ref` | string | Referencia de imagen si `scan-target=image` |
+
+---
+
+#### `cloud-janitor-schedule.yml`
+**Cuándo corre:** De **lunes a viernes a las 20:00 UTC** (automático) + manual vía `workflow_dispatch`.
+
+**Qué hace, paso a paso:**
+1. Login a Azure con OIDC
+2. Lista todas las VMs que tengan el tag `environment=dev` (o el valor configurado manualmente)
+3. En modo real: envía señal de `deallocate` a todas las VMs encontradas (apagado completo, sin costo de cómputo)
+4. Escribe un **Job Summary** con tabla: tag objetivo, cantidad de VMs apagadas, modo y timestamp
+
+**Parámetros del dispatch manual:**
+| Input | Opciones | Descripción |
+|---|---|---|
+| `dry-run` | `false` / `true` | Si `true`, lista las VMs pero no las apaga |
+| `target-tag-value` | string | Valor del tag `environment` a buscar (default: `dev`) |
+
+---
+
+## Patrones de encadenamiento
+
+### Patrón 1: CI completo para un repositorio de infraestructura Terraform
 
 ```yaml
-# .github/workflows/ci.yml (en tu repositorio esclavo/proyecto)
+# .github/workflows/ci.yml (en tu repo de infraestructura)
+name: "CI"
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  validar-scripts:
-    uses: santiagodaros/devops-core-pipelines/.github/workflows/script-validation-base.yml@main
+  # 1. En PRs: reporte de calidad como comentario
+  validar-pr:
+    if: github.event_name == 'pull_request'
+    permissions:
+      pull-requests: write
+    uses: santiagodaros/devops-core-pipelines/.github/workflows/pr-validation-base.yml@main
     with:
-      working-directory: "./scripts"
-      fail-on-secrets: true
+      scripts-directory: "./scripts"
     secrets: inherit
-```
 
-### Ejemplo: Invocar el Terraform Development Helper
+  # 2. En PRs: validar y simular IaC (incluye Checkov)
+  simular-iac:
+    if: github.event_name == 'pull_request'
+    uses: santiagodaros/devops-core-pipelines/.github/workflows/iac-simulation-base.yml@main
+    with:
+      iac-type: "terraform"
+      working-directory: "./terraform"
+    secrets: inherit
 
-```yaml
-# .github/workflows/tf-helper.yml (en tu repositorio de infraestructura Terraform)
-jobs:
-  tf-helper:
+  # 3. En PRs: estimación de costos
+  estimar-costos:
+    if: github.event_name == 'pull_request'
+    needs: simular-iac        # Solo si la simulación pasó
+    permissions:
+      pull-requests: write
+    uses: santiagodaros/devops-core-pipelines/.github/workflows/cost-estimation-base.yml@main
+    with:
+      working-directory: "./terraform"
+    secrets: inherit
+
+  # 4. En PRs: autoformat + docs con auto-commit
+  helper-terraform:
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: write
     uses: santiagodaros/devops-core-pipelines/.github/workflows/tf-development-helper.yml@main
     with:
-      working-directory: "./infra"
-      fail-on-tflint-errors: true
+      working-directory: "./terraform"
     secrets: inherit
-```
 
-> El pipeline formateará el código, correrá TFLint y actualizará el `README.md` con la documentación de variables/outputs, haciendo un **auto-commit** directo a tu rama con todos los cambios.
-
-### Ejemplo: Invocar el pipeline de despliegue IaC
-
-```yaml
-# .github/workflows/deploy.yml (en tu repositorio de infraestructura)
-jobs:
-  desplegar-dev:
+  # 5. En main: despliegue real (solo si viene de merge)
+  desplegar:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: []                 # No depende de los jobs de PR
     uses: santiagodaros/devops-core-pipelines/.github/workflows/iac-deployment-base.yml@main
     with:
       cloud-provider: "azure"
-      iac-type: "bicep"
-      environment: "dev"
-      azure-resource-group: "rg-mi-proyecto-dev"
+      iac-type: "terraform"
+      environment: "prod"
+      azure-resource-group: "rg-mi-proyecto-prod"
+    secrets: inherit
+
+  # 6. En main: release semántico (después del despliegue)
+  release:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: desplegar
+    permissions:
+      contents: write
+    uses: santiagodaros/devops-core-pipelines/.github/workflows/release-base.yml@main
+    secrets: inherit
+```
+
+**Flujo visual:**
+```
+PR abierto  →  pr-validation  ──────────────────────────────┐
+            →  iac-simulation  →  cost-estimation            │  comentarios en PR
+            →  tf-helper (auto-commit fmt+docs)              │
+                                                             ▼
+merge a main  →  iac-deployment  →  release (tag + CHANGELOG)
+```
+
+---
+
+### Patrón 2: CI para un repositorio de aplicación con Docker
+
+```yaml
+# .github/workflows/ci.yml
+jobs:
+  # 1. Validar scripts y secretos en PRs
+  validar-pr:
+    if: github.event_name == 'pull_request'
+    permissions:
+      pull-requests: write
+    uses: santiagodaros/devops-core-pipelines/.github/workflows/pr-validation-base.yml@main
+    secrets: inherit
+
+  # 2. Build, scan y push de imagen (en PRs y en main)
+  build-imagen:
+    uses: santiagodaros/devops-core-pipelines/.github/workflows/container-build-base.yml@main
+    with:
+      image-name: "mi-aplicacion"
+      registry: "ghcr"
+      severity-threshold: "CRITICAL"
+    secrets: inherit
+
+  # 3. Release solo en main
+  release:
+    if: github.ref == 'refs/heads/main'
+    needs: build-imagen
+    permissions:
+      contents: write
+    uses: santiagodaros/devops-core-pipelines/.github/workflows/release-base.yml@main
+    secrets: inherit
+```
+
+**Flujo visual:**
+```
+PR abierto  →  pr-validation (comentario en PR)
+            →  container-build → Trivy scan → push imagen con tag sha-xxxxx
+
+merge a main  →  container-build → push imagen con tag v1.2.3
+              →  release → CHANGELOG + GitHub Release v1.2.3
+```
+
+---
+
+### Patrón 3: Pipeline mínimo (validación básica)
+
+Para proyectos pequeños o primeras iteraciones, con solo 6 líneas:
+
+```yaml
+jobs:
+  validar:
+    uses: santiagodaros/devops-core-pipelines/.github/workflows/script-validation-base.yml@main
+    with:
+      working-directory: "./scripts"
     secrets: inherit
 ```
 
 ---
 
-## Configuración de secretos necesarios
+## Configuración de secretos
 
-Para los pipelines de Azure, configura los siguientes **secretos** en tu repositorio (o en la organización):
+### Secretos de Azure (OIDC — sin credenciales estáticas)
 
-| Secreto | Descripción |
-|---|---|
-| `AZURE_CLIENT_ID` | Client ID de la App Registration con Federated Credentials |
-| `AZURE_TENANT_ID` | Tenant ID del directorio de Azure AD |
-| `AZURE_SUBSCRIPTION_ID` | ID de la suscripción Azure de destino |
+| Secreto | Usado en | Descripción |
+|---|---|---|
+| `AZURE_CLIENT_ID` | iac-simulation, iac-deployment, container-build (ACR), cloud-janitor | Client ID de la App Registration |
+| `AZURE_TENANT_ID` | Todos los pipelines de Azure | Tenant ID del directorio Azure AD |
+| `AZURE_SUBSCRIPTION_ID` | Todos los pipelines de Azure | ID de la suscripción destino |
 
-> Los pipelines usan **OIDC (OpenID Connect)** para autenticarse. Esto elimina la necesidad de secretos estáticos de larga duración.
+### Secretos de AWS (OIDC)
 
-### Configurar Federated Credentials en Azure
+| Secreto | Usado en | Descripción |
+|---|---|---|
+| `AWS_ROLE_ARN` | iac-deployment (AWS), container-build (ECR) | ARN del rol IAM a asumir |
+
+### Otros secretos
+
+| Secreto | Usado en | Descripción |
+|---|---|---|
+| `INFRACOST_API_KEY` | cost-estimation | API key gratuita de infracost.io |
+| `GITLEAKS_LICENSE` | script-validation, pr-validation | Opcional, para features avanzados de Gitleaks |
+
+### Configurar Federated Credentials en Azure (una sola vez por repo)
 
 ```bash
 az ad app federated-credential create \
   --id <APP_OBJECT_ID> \
   --parameters '{
-    "name": "github-actions",
+    "name": "github-<nombre-repo>",
     "issuer": "https://token.actions.githubusercontent.com",
-    "subject": "repo:santiagodaros/tu-repositorio:environment:prod",
+    "subject": "repo:santiagodaros/<nombre-repo>:environment:prod",
     "audiences": ["api://AzureADTokenExchange"]
   }'
 ```
 
 ---
 
-## Preparar tu módulo Terraform para terraform-docs
+## Mantenimiento automático (Dependabot)
 
-Para que el pipeline `tf-development-helper.yml` pueda inyectar la documentación generada, agrega estos marcadores en el `README.md` de tu módulo Terraform:
+Este repositorio tiene Dependabot configurado para actualizar automáticamente las versiones de todas las GitHub Actions cada **lunes a las 9:00 AM (Argentina)**. Los PRs de actualización se crean con el label `dependencies` y se asignan para revisión.
 
-```markdown
-## Referencia del módulo
-
-<!-- BEGIN_TF_DOCS -->
-<!-- END_TF_DOCS -->
-```
-
-El pipeline reemplazará automáticamente el contenido entre esos marcadores con la documentación actualizada de variables, outputs y recursos.
-
----
-
-## Versionado y mejores prácticas
-
-- Siempre referencia los pipelines desde una **rama estable** (`@main`) o **tag** (`@v1.0.0`).
-- Usa `secrets: inherit` para pasar los secretos del repositorio invocador automáticamente.
-- Los pipelines programados solo se ejecutan desde **este repositorio**, no desde los repositorios esclavos.
-- El pipeline `tf-development-helper.yml` requiere que el repositorio invocador tenga habilitado **"Allow GitHub Actions to create and approve pull requests"** en Settings → Actions → General.
-- Para modificaciones, abre un Pull Request y solicita revisión antes de mergear a `main`.
+Esto garantiza que todos los proyectos que consumen estos pipelines siempre estén usando versiones seguras y actualizadas de las actions de la comunidad.
 
 ---
 
@@ -150,7 +483,7 @@ El pipeline reemplazará automáticamente el contenido entre esos marcadores con
 1. Crea una rama: `git checkout -b feature/nuevo-pipeline`
 2. Agrega o modifica el pipeline en `.github/workflows/`
 3. Abre un Pull Request con descripción del cambio y casos de uso
-4. Requiere aprobación de al menos 1 revisor antes de mergear
+4. Requiere aprobación de al menos 1 revisor antes de mergear a `main`
 
 ---
 
