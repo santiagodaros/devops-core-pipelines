@@ -1,0 +1,200 @@
+# =============================================================================
+# Pipeline Base: Build y Push de Contenedor Docker (Reusable Workflow)
+# Disparador: workflow_call (invocado desde repositorios esclavos)
+# Propósito: Construye la imagen Docker, la escanea con Trivy en busca de
+#            vulnerabilidades y la pushea al registry configurado
+#            (GHCR, ACR o ECR) con tags semánticos.
+# =============================================================================
+name: "Base - Build y Push de Contenedor"
+
+on:
+  workflow_call:
+    inputs:
+      registry:
+        description: "Registry destino: 'ghcr' (GitHub), 'acr' (Azure) o 'ecr' (AWS)"
+        required: false
+        type: string
+        default: "ghcr"
+      dockerfile-path:
+        description: "Ruta al Dockerfile"
+        required: false
+        type: string
+        default: "./Dockerfile"
+      build-context:
+        description: "Contexto de build de Docker"
+        required: false
+        type: string
+        default: "."
+      image-name:
+        description: "Nombre de la imagen (sin registry prefix). Ej: mi-app"
+        required: true
+        type: string
+      acr-name:
+        description: "Nombre del Azure Container Registry (solo si registry=acr). Ej: miregistry"
+        required: false
+        type: string
+        default: ""
+      severity-threshold:
+        description: "Nivel mínimo de severidad para fallar por vulnerabilidades Trivy"
+        required: false
+        type: string
+        default: "CRITICAL"
+      platforms:
+        description: "Plataformas de build (ej: linux/amd64,linux/arm64)"
+        required: false
+        type: string
+        default: "linux/amd64"
+    secrets:
+      AZURE_CLIENT_ID:
+        description: "Client ID Azure para ACR (OIDC)"
+        required: false
+      AZURE_TENANT_ID:
+        description: "Tenant ID de Azure"
+        required: false
+      AZURE_SUBSCRIPTION_ID:
+        description: "Subscription ID de Azure"
+        required: false
+      AWS_ROLE_ARN:
+        description: "ARN del rol IAM para ECR (OIDC)"
+        required: false
+    outputs:
+      image-tag:
+        description: "Tag completo de la imagen publicada"
+        value: ${{ jobs.build-and-push.outputs.image-tag }}
+      image-digest:
+        description: "Digest SHA256 de la imagen publicada"
+        value: ${{ jobs.build-and-push.outputs.digest }}
+
+permissions:
+  contents: read
+  packages: write        # Necesario para push a GHCR
+  id-token: write        # Necesario para OIDC (ACR/ECR)
+  security-events: write # Para publicar resultados SARIF de Trivy
+
+jobs:
+  build-and-push:
+    name: "Build → Scan → Push (${{ inputs.registry }})"
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      digest:    ${{ steps.push.outputs.digest }}
+
+    steps:
+      - name: "Checkout del código fuente"
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Autenticación según el registry seleccionado
+      # -----------------------------------------------------------------------
+      - name: "Login a GitHub Container Registry (GHCR)"
+        if: inputs.registry == 'ghcr'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: "Login a Azure Container Registry (ACR) con OIDC"
+        if: inputs.registry == 'acr'
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: "Obtener credenciales ACR"
+        if: inputs.registry == 'acr'
+        run: az acr login --name ${{ inputs.acr-name }}
+
+      - name: "Configurar credenciales AWS para ECR"
+        if: inputs.registry == 'ecr'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: "Login a Amazon ECR"
+        if: inputs.registry == 'ecr'
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # -----------------------------------------------------------------------
+      # Build
+      # -----------------------------------------------------------------------
+      - name: "Configurar QEMU (para builds multi-plataforma)"
+        uses: docker/setup-qemu-action@v3
+
+      - name: "Configurar Docker Buildx"
+        uses: docker/setup-buildx-action@v3
+
+      - name: "Generar tags y labels de la imagen"
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ inputs.registry == 'ghcr' && format('ghcr.io/{0}/{1}', github.repository_owner, inputs.image-name) || '' }}
+            ${{ inputs.registry == 'acr'  && format('{0}.azurecr.io/{1}', inputs.acr-name, inputs.image-name) || '' }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-,format=short
+
+      - name: "Build de la imagen Docker"
+        uses: docker/build-push-action@v6
+        with:
+          context:    ${{ inputs.build-context }}
+          file:       ${{ inputs.dockerfile-path }}
+          platforms:  ${{ inputs.platforms }}
+          tags:       ${{ steps.meta.outputs.tags }}
+          labels:     ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+          load: true    # Cargar localmente para el escaneo Trivy antes del push
+          push: false
+
+      # -----------------------------------------------------------------------
+      # Escaneo de vulnerabilidades con Trivy
+      # -----------------------------------------------------------------------
+      - name: "Escanear imagen con Trivy"
+        id: trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref:  ${{ steps.meta.outputs.tags }}
+          format:     "sarif"
+          output:     "trivy-image-results.sarif"
+          severity:   ${{ inputs.severity-threshold }}
+          exit-code:  "1"    # Falla si hay vulnerabilidades del nivel indicado
+        continue-on-error: true
+
+      - name: "Publicar resultados Trivy en GitHub Security"
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "trivy-image-results.sarif"
+          category:   "trivy-container"
+
+      # -----------------------------------------------------------------------
+      # Push al registry (solo si Trivy no encontró vulnerabilidades críticas)
+      # -----------------------------------------------------------------------
+      - name: "Push de la imagen al registry"
+        id: push
+        if: steps.trivy.outcome == 'success'
+        uses: docker/build-push-action@v6
+        with:
+          context:    ${{ inputs.build-context }}
+          file:       ${{ inputs.dockerfile-path }}
+          platforms:  ${{ inputs.platforms }}
+          tags:       ${{ steps.meta.outputs.tags }}
+          labels:     ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+          push: true
+
+      - name: "Abortar push por vulnerabilidades críticas"
+        if: steps.trivy.outcome == 'failure'
+        run: |
+          echo "❌ Push bloqueado: Trivy detectó vulnerabilidades de nivel ${{ inputs.severity-threshold }}."
+          echo "Revisá la pestaña Security → Code scanning del repositorio para ver el detalle."
+          exit 1

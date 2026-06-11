@@ -1,0 +1,132 @@
+# =============================================================================
+# Pipeline Base: Release Semántico Automático (Reusable Workflow)
+# Disparador: workflow_call (invocado desde repositorios esclavos)
+# Propósito: Genera automáticamente CHANGELOG.md, crea el tag de versión
+#            semántico (vX.Y.Z) y publica el GitHub Release basándose en
+#            los mensajes de commit (Conventional Commits).
+#
+# Convención de commits requerida:
+#   feat: nueva funcionalidad   → bump MINOR (v1.1.0)
+#   fix: corrección de bug      → bump PATCH (v1.0.1)
+#   feat!: o BREAKING CHANGE    → bump MAJOR (v2.0.0)
+#   chore/docs/style/refactor   → sin release
+# =============================================================================
+name: "Base - Release Semántico"
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Versión de Node.js para semantic-release"
+        required: false
+        type: string
+        default: "20"
+      release-branches:
+        description: "Ramas desde las que se permite hacer release (JSON array)"
+        required: false
+        type: string
+        default: '["main"]'
+      dry-run:
+        description: "Simula el release sin crear el tag ni publicar"
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      version:
+        description: "Versión publicada (ej: 1.2.3). Vacío si no se generó release."
+        value: ${{ jobs.semantic-release.outputs.version }}
+      released:
+        description: "'true' si se publicó un nuevo release"
+        value: ${{ jobs.semantic-release.outputs.released }}
+
+permissions:
+  contents: write        # Para crear tags y releases
+  issues: write          # Para cerrar issues mencionados en commits
+  pull-requests: write   # Para comentar PRs mergeados
+
+jobs:
+  semantic-release:
+    name: "Semantic Release"
+    runs-on: ubuntu-latest
+    outputs:
+      version:  ${{ steps.release.outputs.nextVersion }}
+      released: ${{ steps.release.outputs.released }}
+    steps:
+      - name: "Checkout del código fuente (historial completo)"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: "Configurar Node.js"
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: "Instalar semantic-release y plugins"
+        run: |
+          npm install --save-dev \
+            semantic-release \
+            @semantic-release/changelog \
+            @semantic-release/git \
+            @semantic-release/github \
+            @semantic-release/commit-analyzer \
+            @semantic-release/release-notes-generator
+
+      - name: "Generar configuración de semantic-release"
+        run: |
+          # Usa .releaserc del repo si existe, sino genera uno por defecto
+          if [ ! -f ".releaserc" ] && [ ! -f ".releaserc.json" ] && [ ! -f "release.config.js" ]; then
+            cat > .releaserc.json << 'EOF'
+          {
+            "branches": ${{ inputs.release-branches }},
+            "plugins": [
+              ["@semantic-release/commit-analyzer", {
+                "preset": "angular",
+                "releaseRules": [
+                  {"type": "feat",     "release": "minor"},
+                  {"type": "fix",      "release": "patch"},
+                  {"type": "perf",     "release": "patch"},
+                  {"type": "refactor", "release": false},
+                  {"type": "docs",     "release": false},
+                  {"type": "chore",    "release": false}
+                ]
+              }],
+              "@semantic-release/release-notes-generator",
+              ["@semantic-release/changelog", {
+                "changelogFile": "CHANGELOG.md"
+              }],
+              ["@semantic-release/git", {
+                "assets": ["CHANGELOG.md"],
+                "message": "chore(release): ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}"
+              }],
+              "@semantic-release/github"
+            ]
+          }
+          EOF
+            echo "Usando configuración por defecto de semantic-release."
+          else
+            echo "Usando .releaserc existente en el repositorio."
+          fi
+
+      - name: "Ejecutar Semantic Release"
+        id: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ inputs.dry-run }}" = "true" ]; then
+            npx semantic-release --dry-run 2>&1 | tee release-output.txt
+          else
+            npx semantic-release 2>&1 | tee release-output.txt
+          fi
+
+          # Extraer versión publicada del output
+          VERSION=$(grep -oP "Published release \K[0-9]+\.[0-9]+\.[0-9]+" release-output.txt || echo "")
+          if [ -n "$VERSION" ]; then
+            echo "nextVersion=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "released=true"        >> "$GITHUB_OUTPUT"
+            echo "✅ Release v$VERSION publicado correctamente."
+          else
+            echo "released=false" >> "$GITHUB_OUTPUT"
+            echo "ℹ️  No se generó un nuevo release (sin commits relevantes desde el último tag)."
+          fi

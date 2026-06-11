@@ -1,0 +1,110 @@
+# =============================================================================
+# Pipeline Base: Estimación de Costos con Infracost (Reusable Workflow)
+# Disparador: workflow_call (invocado desde repositorios esclavos en PRs)
+# Propósito: Calcula el delta de costo mensual de los cambios de Terraform
+#            y publica un comentario detallado directamente en el PR.
+# Prerequisito: Configurar el secret INFRACOST_API_KEY en el repo (gratis en infracost.io)
+# =============================================================================
+name: "Base - Estimación de Costos (Infracost)"
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Directorio donde se encuentra el código Terraform"
+        required: false
+        type: string
+        default: "."
+      terraform-version:
+        description: "Versión de Terraform a utilizar"
+        required: false
+        type: string
+        default: "latest"
+      currency:
+        description: "Moneda para el reporte de costos (USD, EUR, GBP, etc.)"
+        required: false
+        type: string
+        default: "USD"
+    secrets:
+      INFRACOST_API_KEY:
+        description: "API key de Infracost (obtener gratis en infracost.io)"
+        required: true
+      AZURE_CLIENT_ID:
+        description: "Client ID para autenticación Azure (opcional, mejora precisión)"
+        required: false
+      AZURE_TENANT_ID:
+        description: "Tenant ID de Azure"
+        required: false
+      AZURE_SUBSCRIPTION_ID:
+        description: "Subscription ID de Azure"
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  infracost:
+    name: "Estimación de costos con Infracost"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout del código fuente (rama base del PR)"
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          path: base
+
+      - name: "Checkout del código fuente (rama del PR)"
+        uses: actions/checkout@v4
+        with:
+          path: head
+
+      - name: "Configurar Terraform"
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: false
+
+      - name: "Instalar Infracost CLI"
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+          currency: ${{ inputs.currency }}
+
+      - name: "Generar estimación de costos — rama BASE (antes del PR)"
+        run: |
+          infracost breakdown \
+            --path base/${{ inputs.working-directory }} \
+            --format json \
+            --out-file /tmp/infracost-base.json \
+            --no-cache
+        continue-on-error: true   # Si el módulo no tiene recursos con costo, no falla
+
+      - name: "Generar estimación de costos — rama HEAD (después del PR)"
+        run: |
+          infracost breakdown \
+            --path head/${{ inputs.working-directory }} \
+            --format json \
+            --out-file /tmp/infracost-head.json \
+            --no-cache
+        continue-on-error: true
+
+      - name: "Calcular diferencia de costos (diff)"
+        id: infracost-diff
+        run: |
+          infracost diff \
+            --path /tmp/infracost-head.json \
+            --compare-to /tmp/infracost-base.json \
+            --format json \
+            --out-file /tmp/infracost-diff.json
+
+          MONTHLY_COST=$(cat /tmp/infracost-diff.json | jq -r '.totalMonthlyCost // "0"')
+          DIFF_COST=$(cat /tmp/infracost-diff.json | jq -r '.diffTotalMonthlyCost // "0"')
+          echo "monthly_cost=$MONTHLY_COST" >> "$GITHUB_OUTPUT"
+          echo "diff_cost=$DIFF_COST"       >> "$GITHUB_OUTPUT"
+
+      - name: "Publicar reporte de costos en el Pull Request"
+        uses: infracost/actions/comment@v3
+        with:
+          path: /tmp/infracost-diff.json
+          behavior: update    # Actualiza el comentario existente en lugar de duplicar

@@ -1,0 +1,146 @@
+# =============================================================================
+# Pipeline Base: Validación de Pull Requests (Reusable Workflow)
+# Disparador: workflow_call (invocado desde repositorios esclavos)
+# Propósito: Corre PSScriptAnalyzer + Gitleaks y publica los resultados
+#            como un comentario consolidado directamente en el PR.
+# =============================================================================
+name: "Base - Validación de Pull Request"
+
+on:
+  workflow_call:
+    inputs:
+      scripts-directory:
+        description: "Directorio donde se encuentran los scripts a analizar"
+        required: false
+        type: string
+        default: "."
+      fail-on-warnings:
+        description: "Falla el pipeline si PSScriptAnalyzer encuentra warnings (no solo errores)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  pull-requests: write   # Necesario para publicar el comentario en el PR
+
+jobs:
+  pr-quality-report:
+    name: "Análisis y reporte en PR"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout del código fuente"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # -----------------------------------------------------------------------
+      # PSScriptAnalyzer (corre en PowerShell Core sobre ubuntu-latest)
+      # -----------------------------------------------------------------------
+      - name: "Instalar PSScriptAnalyzer"
+        shell: pwsh
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+
+      - name: "Ejecutar PSScriptAnalyzer y guardar resultados"
+        id: psanalyzer
+        shell: pwsh
+        run: |
+          $dir = "${{ inputs.scripts-directory }}"
+          $scripts = Get-ChildItem -Path $dir -Recurse -Filter "*.ps1" -ErrorAction SilentlyContinue
+
+          if ($scripts.Count -eq 0) {
+            "ps_output=No se encontraron archivos .ps1 para analizar." | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "ps_status=skipped" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            exit 0
+          }
+
+          $severity = if ("${{ inputs.fail-on-warnings }}" -eq "true") {
+            @("Error","Warning")
+          } else {
+            @("Error")
+          }
+
+          $results = $scripts | Invoke-ScriptAnalyzer -Severity $severity
+          $output = if ($results) {
+            $results | ForEach-Object { "- ``$($_.ScriptName):$($_.Line)`` **[$($_.Severity)]** $($_.Message)" } | Out-String
+            "ps_status=failed" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            "ps_status=passed" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "No se encontraron problemas."
+          }
+
+          # Escapar saltos de línea para GitHub Output
+          $escaped = $output -replace "`r`n","\n" -replace "`n","\n"
+          "ps_output=$escaped" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      # -----------------------------------------------------------------------
+      # Gitleaks
+      # -----------------------------------------------------------------------
+      - name: "Escanear secretos con Gitleaks"
+        id: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      # -----------------------------------------------------------------------
+      # Publicar comentario consolidado en el PR
+      # -----------------------------------------------------------------------
+      - name: "Publicar reporte en el Pull Request"
+        if: github.event_name == 'pull_request' || github.event.pull_request != null
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const psStatus   = '${{ steps.psanalyzer.outputs.ps_status }}';
+            const psOutput   = `${{ steps.psanalyzer.outputs.ps_output }}`.replace(/\\n/g, '\n');
+            const leaksOk    = '${{ steps.gitleaks.outcome }}' === 'success';
+
+            const icon  = (ok) => ok ? '✅' : '❌';
+            const badge = (ok) => ok ? '`PASSED`' : '`FAILED`';
+
+            const body = `## 🔍 Reporte de Calidad — PR #${{ github.event.pull_request.number }}
+
+            | Check | Estado |
+            |---|---|
+            | PSScriptAnalyzer | ${icon(psStatus !== 'failed')} ${badge(psStatus !== 'failed')} |
+            | Gitleaks (secretos) | ${icon(leaksOk)} ${badge(leaksOk)} |
+
+            ### PSScriptAnalyzer
+            ${psOutput || '_Sin resultados_'}
+
+            ### Gitleaks
+            ${leaksOk ? 'No se detectaron secretos expuestos.' : '⚠️ Se detectaron posibles secretos. Revisá el log del job para más detalles.'}
+
+            ---
+            _Generado automáticamente por [devops-core-pipelines](https://github.com/santiagodaros/devops-core-pipelines)_`;
+
+            // Buscar comentario previo del bot para actualizar en lugar de duplicar
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c =>
+              c.user.login === 'github-actions[bot]' &&
+              c.body.includes('Reporte de Calidad')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }

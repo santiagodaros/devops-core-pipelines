@@ -1,8 +1,8 @@
 # =============================================================================
 # Pipeline Base: Simulación de IaC (Reusable Workflow)
 # Disparador: workflow_call (invocado desde repositorios esclavos)
-# Propósito: Valida sintaxis de Bicep/Terraform y ejecuta What-If / Plan
-#            sin aplicar cambios reales en la nube.
+# Propósito: Valida sintaxis de Bicep/Terraform, ejecuta What-If / Plan
+#            y escanea seguridad con Checkov sin aplicar cambios reales.
 # =============================================================================
 name: "Base - Simulación de IaC"
 
@@ -28,6 +28,16 @@ on:
         required: false
         type: string
         default: "eastus"
+      checkov-skip-checks:
+        description: "IDs de checks de Checkov a omitir (separados por coma). Ej: CKV_AZURE_1,CKV_AZURE_2"
+        required: false
+        type: string
+        default: ""
+      fail-on-checkov-errors:
+        description: "Falla el pipeline si Checkov detecta configuraciones inseguras"
+        required: false
+        type: boolean
+        default: true
     secrets:
       AZURE_CLIENT_ID:
         description: "Client ID de la identidad federada Azure (OIDC)"
@@ -42,6 +52,7 @@ on:
 permissions:
   id-token: write
   contents: read
+  security-events: write   # Para publicar resultados SARIF de Checkov
 
 jobs:
   validate-bicep:
@@ -108,3 +119,29 @@ jobs:
 
       - name: "Verificar formato de archivos Terraform"
         run: terraform fmt -check -recursive
+
+  checkov-security:
+    name: "Checkov - Escaneo de Seguridad IaC"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout del código fuente"
+        uses: actions/checkout@v4
+
+      - name: "Ejecutar Checkov"
+        id: checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: ${{ inputs.working-directory }}
+          framework: ${{ inputs.iac-type == 'terraform' && 'terraform' || 'arm' }}
+          output_format: cli,sarif
+          output_file_path: console,checkov-results.sarif
+          skip_check: ${{ inputs.checkov-skip-checks }}
+          soft_fail: ${{ !inputs.fail-on-checkov-errors }}
+          download_external_modules: false
+
+      - name: "Publicar resultados Checkov en GitHub Security"
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: checkov-results.sarif
+          category: "checkov-iac"

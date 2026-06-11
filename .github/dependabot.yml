@@ -1,0 +1,17 @@
+version: 2
+updates:
+  # Mantener actualizadas las GitHub Actions de este repositorio central
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Argentina/Buenos_Aires"
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - "dependencies"
+      - "github-actions"
+    reviewers:
+      - "santiagodaros"

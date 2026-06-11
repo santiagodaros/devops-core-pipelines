@@ -67,6 +67,14 @@ jobs:
         with:
           terraform_version: ${{ inputs.terraform-version }}
 
+      - name: "Cachear providers de Terraform"
+        uses: actions/cache@v4
+        with:
+          path: ${{ inputs.working-directory }}/.terraform
+          key: terraform-providers-${{ runner.os }}-${{ hashFiles(format('{0}/.terraform.lock.hcl', inputs.working-directory)) }}
+          restore-keys: |
+            terraform-providers-${{ runner.os }}-
+
       - name: "Aplicar terraform fmt recursivo"
         id: fmt
         run: |
@@ -104,6 +112,14 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ inputs.terraform-version }}
+
+      - name: "Restaurar caché de providers"
+        uses: actions/cache@v4
+        with:
+          path: ${{ inputs.working-directory }}/.terraform
+          key: terraform-providers-${{ runner.os }}-${{ hashFiles(format('{0}/.terraform.lock.hcl', inputs.working-directory)) }}
+          restore-keys: |
+            terraform-providers-${{ runner.os }}-
 
       - name: "Instalar TFLint"
         uses: terraform-linters/setup-tflint@v4
