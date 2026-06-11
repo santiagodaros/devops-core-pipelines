@@ -1,0 +1,163 @@
+# =============================================================================
+# Pipeline Base: Terraform Development Helper (Reusable Workflow)
+# Disparador: workflow_call (invocado desde repositorios esclavos)
+# Propósito: Formatea código con terraform fmt, valida con TFLint,
+#            genera documentación con terraform-docs y hace auto-commit
+#            de todas las mejoras directamente a la rama del proyecto.
+# =============================================================================
+name: "Base - Terraform Development Helper"
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Directorio raíz donde se encuentra el código Terraform"
+        required: false
+        type: string
+        default: "."
+      terraform-version:
+        description: "Versión de Terraform a utilizar"
+        required: false
+        type: string
+        default: "latest"
+      tflint-version:
+        description: "Versión de TFLint a utilizar"
+        required: false
+        type: string
+        default: "latest"
+      terraform-docs-version:
+        description: "Versión de terraform-docs a utilizar"
+        required: false
+        type: string
+        default: "v0.19.0"
+      commit-message:
+        description: "Mensaje del auto-commit con las mejoras aplicadas"
+        required: false
+        type: string
+        default: "chore(terraform): fmt + tflint fixes + docs auto-generated [skip ci]"
+      fail-on-tflint-errors:
+        description: "Falla el pipeline si TFLint encuentra errores (no warnings)"
+        required: false
+        type: boolean
+        default: true
+
+# Permiso de escritura necesario para el auto-commit
+permissions:
+  contents: write
+
+jobs:
+  tf-format:
+    name: "Terraform fmt - Formateo de código"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    outputs:
+      fmt-changed: ${{ steps.fmt.outputs.changed }}
+    steps:
+      - name: "Checkout del código fuente"
+        uses: actions/checkout@v4
+        with:
+          # Checkout de la rama que disparó el workflow en el repo origen
+          ref: ${{ github.head_ref || github.ref_name }}
+          fetch-depth: 0
+
+      - name: "Configurar Terraform"
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+
+      - name: "Aplicar terraform fmt recursivo"
+        id: fmt
+        run: |
+          terraform fmt -recursive -diff
+          if git diff --exit-code; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "✅ Código ya estaba correctamente formateado."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "⚠️  Se aplicaron correcciones de formato."
+          fi
+
+      - name: "Subir archivos formateados como artefacto"
+        if: steps.fmt.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tf-formatted-files
+          path: ${{ inputs.working-directory }}
+          retention-days: 1
+
+  tf-lint:
+    name: "TFLint - Análisis estático de Terraform"
+    runs-on: ubuntu-latest
+    needs: tf-format
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: "Checkout del código fuente"
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+
+      - name: "Configurar Terraform"
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+
+      - name: "Instalar TFLint"
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: ${{ inputs.tflint-version }}
+
+      - name: "Inicializar plugins de TFLint"
+        run: tflint --init
+
+      - name: "Ejecutar TFLint"
+        run: |
+          tflint --recursive --format=compact 2>&1 | tee tflint-report.txt
+          EXIT_CODE=${PIPESTATUS[0]}
+          if [ "$EXIT_CODE" -ne 0 ] && [ "${{ inputs.fail-on-tflint-errors }}" = "true" ]; then
+            echo "❌ TFLint encontró errores. Revisa el reporte arriba."
+            exit $EXIT_CODE
+          elif [ "$EXIT_CODE" -ne 0 ]; then
+            echo "⚠️  TFLint encontró advertencias (pipeline no bloqueado por configuración)."
+          else
+            echo "✅ TFLint no encontró problemas."
+          fi
+
+  tf-docs:
+    name: "terraform-docs - Generación de documentación"
+    runs-on: ubuntu-latest
+    needs: tf-lint
+    steps:
+      - name: "Checkout del código fuente"
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+          # Token con permisos de escritura para el auto-commit
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: "Generar documentación con terraform-docs"
+        uses: terraform-docs/gh-actions@v1
+        with:
+          working-dir: ${{ inputs.working-directory }}
+          output-file: README.md
+          output-method: inject
+          # Inserta entre los marcadores <!-- BEGIN_TF_DOCS --> y <!-- END_TF_DOCS -->
+          git-push: "false"
+          template: |-
+            <!-- BEGIN_TF_DOCS -->
+            {{ .Content }}
+            <!-- END_TF_DOCS -->
+
+      - name: "Auto-commit: formato + documentación actualizada"
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: ${{ inputs.commit-message }}
+          file_pattern: "**/*.tf README.md"
+          commit_user_name: "github-actions[bot]"
+          commit_user_email: "github-actions[bot]@users.noreply.github.com"
+          commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
+          # Si no hay cambios, no falla — simplemente no hace commit
+          skip_dirty_check: false

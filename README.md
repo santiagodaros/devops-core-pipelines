@@ -13,6 +13,7 @@ devops-core-pipelines/
 │       ├── script-validation-base.yml   # Calidad de scripts PowerShell + escaneo de secretos
 │       ├── iac-simulation-base.yml      # Validación sintáctica y simulación What-If/Plan
 │       ├── iac-deployment-base.yml      # Despliegue seguro con identidades federadas (OIDC)
+│       ├── tf-development-helper.yml    # fmt + TFLint + terraform-docs con auto-commit
 │       ├── repo-deep-audit-schedule.yml # Auditoría semanal (Super-Linter + Trivy)
 │       └── cloud-janitor-schedule.yml   # Apagado automático de VMs de desarrollo
 ├── README.md
@@ -32,6 +33,7 @@ Estos pipelines son **"Skills" interconectables**: se invocan desde los workflow
 | `script-validation-base.yml` | Analiza scripts `.ps1` con PSScriptAnalyzer y escanea secretos con Gitleaks |
 | `iac-simulation-base.yml` | Valida sintaxis Bicep/Terraform y ejecuta `What-If` o `terraform plan` |
 | `iac-deployment-base.yml` | Despliega IaC en Azure o AWS usando OIDC (sin secretos estáticos) |
+| `tf-development-helper.yml` | Formatea con `terraform fmt`, analiza con TFLint, genera docs con terraform-docs y hace auto-commit |
 
 ### ⏰ Pipelines Programados (`schedule`)
 
@@ -52,14 +54,27 @@ Desde cualquier repositorio de tu organización, crea un archivo `.github/workfl
 # .github/workflows/ci.yml (en tu repositorio esclavo/proyecto)
 jobs:
   validar-scripts:
-    uses: TU_ORG/devops-core-pipelines/.github/workflows/script-validation-base.yml@main
+    uses: santiagodaros/devops-core-pipelines/.github/workflows/script-validation-base.yml@main
     with:
       working-directory: "./scripts"
       fail-on-secrets: true
     secrets: inherit
 ```
 
-> **Nota:** Reemplaza `TU_ORG` por tu nombre de usuario u organización de GitHub.
+### Ejemplo: Invocar el Terraform Development Helper
+
+```yaml
+# .github/workflows/tf-helper.yml (en tu repositorio de infraestructura Terraform)
+jobs:
+  tf-helper:
+    uses: santiagodaros/devops-core-pipelines/.github/workflows/tf-development-helper.yml@main
+    with:
+      working-directory: "./infra"
+      fail-on-tflint-errors: true
+    secrets: inherit
+```
+
+> El pipeline formateará el código, correrá TFLint y actualizará el `README.md` con la documentación de variables/outputs, haciendo un **auto-commit** directo a tu rama con todos los cambios.
 
 ### Ejemplo: Invocar el pipeline de despliegue IaC
 
@@ -67,7 +82,7 @@ jobs:
 # .github/workflows/deploy.yml (en tu repositorio de infraestructura)
 jobs:
   desplegar-dev:
-    uses: TU_ORG/devops-core-pipelines/.github/workflows/iac-deployment-base.yml@main
+    uses: santiagodaros/devops-core-pipelines/.github/workflows/iac-deployment-base.yml@main
     with:
       cloud-provider: "azure"
       iac-type: "bicep"
@@ -98,10 +113,25 @@ az ad app federated-credential create \
   --parameters '{
     "name": "github-actions",
     "issuer": "https://token.actions.githubusercontent.com",
-    "subject": "repo:TU_ORG/tu-repositorio:environment:prod",
+    "subject": "repo:santiagodaros/tu-repositorio:environment:prod",
     "audiences": ["api://AzureADTokenExchange"]
   }'
 ```
+
+---
+
+## Preparar tu módulo Terraform para terraform-docs
+
+Para que el pipeline `tf-development-helper.yml` pueda inyectar la documentación generada, agrega estos marcadores en el `README.md` de tu módulo Terraform:
+
+```markdown
+## Referencia del módulo
+
+<!-- BEGIN_TF_DOCS -->
+<!-- END_TF_DOCS -->
+```
+
+El pipeline reemplazará automáticamente el contenido entre esos marcadores con la documentación actualizada de variables, outputs y recursos.
 
 ---
 
@@ -109,7 +139,8 @@ az ad app federated-credential create \
 
 - Siempre referencia los pipelines desde una **rama estable** (`@main`) o **tag** (`@v1.0.0`).
 - Usa `secrets: inherit` para pasar los secretos del repositorio invocador automáticamente.
-- Los pipelines programados solo se ejecutan desde el **repositorio donde están definidos** (este repositorio), no desde los repositorios esclavos.
+- Los pipelines programados solo se ejecutan desde **este repositorio**, no desde los repositorios esclavos.
+- El pipeline `tf-development-helper.yml` requiere que el repositorio invocador tenga habilitado **"Allow GitHub Actions to create and approve pull requests"** en Settings → Actions → General.
 - Para modificaciones, abre un Pull Request y solicita revisión antes de mergear a `main`.
 
 ---
