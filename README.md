@@ -586,9 +586,51 @@ az ad app federated-credential create \
 
 ## Mantenimiento automático (Dependabot)
 
-Este repositorio tiene Dependabot configurado para actualizar automáticamente las versiones de todas las GitHub Actions cada **lunes a las 9:00 AM (Argentina)**. Los PRs de actualización se crean con el label `dependencies` y se asignan para revisión.
+Dependabot está configurado en `.github/dependabot.yml` para mantener actualizadas las versiones de todas las GitHub Actions de este repositorio central.
 
-Esto garantiza que todos los proyectos que consumen estos pipelines siempre estén usando versiones seguras y actualizadas de las actions de la comunidad.
+### Cómo funciona
+
+Cada **lunes a las 9:00 AM (hora Argentina)**, Dependabot escanea todos los archivos `.github/workflows/*.yml` buscando referencias desactualizadas del estilo `actions/checkout@v3` o `hashicorp/setup-terraform@v2`. Por cada action desactualizada, abre un **Pull Request automático** con:
+
+- El bump de versión en el archivo YAML correspondiente
+- El changelog de la action actualizada como descripción del PR
+- Los labels `dependencies` y `github-actions`
+- Tu usuario (`@santiagodaros`) como reviewer asignado
+
+### Qué revisar antes de mergear un PR de Dependabot
+
+1. **Leer el changelog** incluido en la descripción del PR — verificar que no haya breaking changes en la nueva versión
+2. **Revisar el diff** — debe ser solo un cambio de versión (`@v3` → `@v4`), nunca lógica nueva
+3. **Verificar que el PR venga de `dependabot[bot]`** — nunca aprobar PRs de `dependencies` que vengan de usuarios humanos sin revisión adicional
+4. **Mergear con squash** para mantener el historial limpio
+
+> Dado que el CODEOWNERS requiere tu aprobación, Dependabot no puede auto-mergear — siempre pasa por revisión humana.
+
+### Impacto en repositorios consumidores
+
+Cuando este repositorio actualiza una action (ej: `actions/checkout@v3 → @v4`), **todos los proyectos esclavos se benefician automáticamente** en su próxima ejecución, sin necesidad de tocar ningún repo de proyecto. Esta es la principal ventaja del patrón centralizado.
+
+### Extender Dependabot a tus repositorios de proyecto
+
+Para que tus repos de proyecto también mantengan sus dependencias actualizadas, crea `.github/dependabot.yml` en cada uno:
+
+```yaml
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    commit-message:
+      prefix: "chore(deps)"
+
+  # Si el repo tiene Terraform, también actualizar providers
+  - package-ecosystem: "terraform"
+    directory: "/terraform"
+    schedule:
+      interval: "weekly"
+```
 
 ---
 
