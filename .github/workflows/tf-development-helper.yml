@@ -56,7 +56,7 @@ jobs:
       fmt-changed: ${{ steps.fmt.outputs.changed }}
     steps:
       - name: "Checkout del código fuente"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           # Checkout de la rama que disparó el workflow en el repo origen
           ref: ${{ github.head_ref || github.ref_name }}
@@ -104,7 +104,7 @@ jobs:
         working-directory: ${{ inputs.working-directory }}
     steps:
       - name: "Checkout del código fuente"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.head_ref || github.ref_name }}
 
@@ -148,7 +148,7 @@ jobs:
     needs: tf-lint
     steps:
       - name: "Checkout del código fuente"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.head_ref || github.ref_name }}
           # Token con permisos de escritura para el auto-commit
