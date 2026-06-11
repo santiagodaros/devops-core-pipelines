@@ -639,6 +639,21 @@ updates:
 ### CODEOWNERS
 El archivo `CODEOWNERS` en la raíz requiere que **@santiagodaros** apruebe cualquier cambio a workflows, Dependabot o documentación. Esto previene modificaciones no revisadas que afectarían a todos los repositorios consumidores.
 
+### Auto-aprobación de PRs del owner (`auto-approve.yml`)
+
+GitHub no permite que un usuario apruebe su propio PR. Para que el owner pueda mergear sus propios cambios sin perder la protección, el workflow `auto-approve.yml` usa `github-actions[bot]` (una cuenta distinta) como reviewer automático.
+
+**Cómo funciona:**
+1. Cuando `santiagodaros` abre o actualiza un PR, el workflow se dispara via `pull_request_target`
+2. `github-actions[bot]` aprueba el PR automáticamente con el comentario `Auto-aprobado: PR del owner verificado`
+3. El owner puede entonces hacer merge desde la UI de GitHub normalmente
+
+**Seguridad:** el guard `if: github.actor == 'santiagodaros'` garantiza que PRs de colaboradores externos o forks **nunca** se auto-aprueban — siempre requieren revisión humana.
+
+**Prerequisito en Settings del repo:** activar `Settings → Actions → General → Workflow permissions → Allow GitHub Actions to create and approve pull requests`.
+
+---
+
 ### Branch protection rules (configurar manualmente una sola vez)
 
 Ir a **Settings → Branches → Add rule** para la rama `main` y activar:
