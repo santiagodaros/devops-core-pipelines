@@ -81,7 +81,7 @@ jobs:
 
     steps:
       - name: "Checkout del código fuente"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       # -----------------------------------------------------------------------
       # Autenticación según el registry seleccionado

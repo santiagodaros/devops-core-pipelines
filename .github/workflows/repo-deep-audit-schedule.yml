@@ -35,7 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: "Checkout del código fuente"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -60,7 +60,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: "Checkout del código fuente"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: "Escanear filesystem con Trivy"
         if: ${{ github.event.inputs.scan-target != 'image' }}

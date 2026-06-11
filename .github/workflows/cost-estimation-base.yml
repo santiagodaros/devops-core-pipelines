@@ -49,13 +49,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: "Checkout del código fuente (rama base del PR)"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.base.ref }}
           path: base
 
       - name: "Checkout del código fuente (rama del PR)"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: head
 

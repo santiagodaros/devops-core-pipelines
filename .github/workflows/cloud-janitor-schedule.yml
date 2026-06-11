@@ -39,7 +39,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: "Checkout del código fuente"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: "Login a Azure con identidad federada (OIDC)"
         uses: azure/login@v2

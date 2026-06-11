@@ -33,7 +33,7 @@ jobs:
         working-directory: ${{ inputs.working-directory }}
     steps:
       - name: "Checkout del código fuente"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: "Instalar PSScriptAnalyzer"
         shell: pwsh
@@ -61,7 +61,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: "Checkout del código fuente"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 

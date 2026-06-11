@@ -64,7 +64,7 @@ jobs:
         working-directory: ${{ inputs.working-directory }}
     steps:
       - name: "Checkout del código fuente"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: "Login a Azure con OIDC (identidad federada)"
         uses: azure/login@v2
@@ -106,7 +106,7 @@ jobs:
         working-directory: ${{ inputs.working-directory }}
     steps:
       - name: "Checkout del código fuente"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: "Configurar Terraform"
         uses: hashicorp/setup-terraform@v3
@@ -125,7 +125,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: "Checkout del código fuente"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: "Ejecutar Checkov"
         id: checkov
